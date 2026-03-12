@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+tokens.json
+uidpass.json
+autolike_tasks.json
+like_limits.json
+like_usage.json
