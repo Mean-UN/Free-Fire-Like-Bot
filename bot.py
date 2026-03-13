@@ -242,7 +242,8 @@ async def like_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(message)
 
 
-async def run_autolike_job(_: ContextTypes.DEFAULT_TYPE | None = None) -> None:
+async def run_autolike_job(context: ContextTypes.DEFAULT_TYPE | None = None) -> None:
+    application = context.application if context else None
     tasks = load_tasks()
     if not tasks:
         return
@@ -306,6 +307,17 @@ async def run_autolike_job(_: ContextTypes.DEFAULT_TYPE | None = None) -> None:
             remaining = total - task["delivered"]
             task["estimated_days"] = int(math.ceil(remaining / added))
 
+        if application and task.get("user_id"):
+            try:
+                application.create_task(
+                    application.bot.send_message(
+                        chat_id=int(task["user_id"]),
+                        text=format_autolike_update(task),
+                    )
+                )
+            except Exception:
+                pass
+
         updated = True
 
     if updated:
@@ -321,7 +333,7 @@ async def daily_autolike_loop(application) -> None:
         if next_run <= now:
             next_run += timedelta(days=1)
         await asyncio.sleep((next_run - now).total_seconds())
-        await run_autolike_job()
+        await run_autolike_job(application)
 
 
 async def my_autolikes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

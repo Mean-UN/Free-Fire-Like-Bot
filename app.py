@@ -1,5 +1,8 @@
 from flask import Flask, request, jsonify
 import asyncio
+import subprocess
+import sys
+import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
@@ -14,6 +17,32 @@ from google.protobuf.message import DecodeError
 import base64
 
 app = Flask(__name__)
+
+_LAST_REFRESH_TS = 0.0
+
+
+def refresh_tokens_if_needed(force: bool = False) -> bool:
+    global _LAST_REFRESH_TS
+    now = time.time()
+    if not force and (now - _LAST_REFRESH_TS) < 300:
+        return True
+    try:
+        result = subprocess.run(
+            [sys.executable, "update_tokens.py"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            app.logger.error(
+                f"update_tokens.py failed: {result.returncode} {result.stderr.strip()}"
+            )
+            return False
+        _LAST_REFRESH_TS = now
+        return True
+    except Exception as exc:
+        app.logger.error(f"Failed to refresh tokens: {exc}")
+        return False
 
 def load_tokens():
     try:
@@ -200,7 +229,13 @@ def handle_requests():
         # Get before likes count
         before = make_request(encrypted_uid, server_name, token)
         if before is None:
-            return jsonify({"error": "Failed to retrieve player info."}), 500
+            if refresh_tokens_if_needed(force=True):
+                tokens = load_tokens() or []
+                if tokens:
+                    token = tokens[0]["token"]
+                before = make_request(encrypted_uid, server_name, token)
+            if before is None:
+                return jsonify({"error": "Failed to retrieve player info."}), 500
         
         data_before = json.loads(MessageToJson(before))
         before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0) or 0)
@@ -221,7 +256,13 @@ def handle_requests():
         # Get after likes count
         after = make_request(encrypted_uid, server_name, token)
         if after is None:
-            return jsonify({"error": "Failed to retrieve player info after likes."}), 500
+            if refresh_tokens_if_needed(force=True):
+                tokens = load_tokens() or []
+                if tokens:
+                    token = tokens[0]["token"]
+                after = make_request(encrypted_uid, server_name, token)
+            if after is None:
+                return jsonify({"error": "Failed to retrieve player info after likes."}), 500
         
         data_after = json.loads(MessageToJson(after))
         account_info = data_after.get('AccountInfo', {})
