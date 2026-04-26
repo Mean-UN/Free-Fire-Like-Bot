@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import asyncio
+import os
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
@@ -14,14 +15,68 @@ from google.protobuf.message import DecodeError
 import base64
 
 app = Flask(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
+UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
+TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 
-def load_tokens():
+def refresh_tokens_from_uidpass():
     try:
-        with open("tokens.json", "r") as f:
+        with open(UIDPASS_FILE, "r", encoding="utf-8") as f:
+            uidpass_list = json.load(f)
+        new_tokens = []
+        failed_uids = []
+
+        for item in uidpass_list:
+            uid = str(item.get("uid", "")).strip()
+            password = str(item.get("password", "")).strip()
+            if not uid or not password:
+                continue
+            try:
+                response = requests.get(
+                    TOKEN_API_URL,
+                    params={"uid": uid, "password": password},
+                    timeout=20
+                )
+                response.raise_for_status()
+                token = response.json().get("token")
+            except Exception:
+                token = None
+            if token and isinstance(token, str):
+                new_tokens.append({"token": token})
+            else:
+                failed_uids.append(uid)
+
+        if new_tokens:
+            with open(TOKENS_FILE, "w", encoding="utf-8") as f:
+                json.dump(new_tokens, f, ensure_ascii=False, indent=4)
+            return True, len(new_tokens), len(uidpass_list), failed_uids
+
+        return False, 0, len(uidpass_list), failed_uids
+    except Exception as e:
+        app.logger.error(f"Auto token refresh failed: {e}")
+        return False, 0, 0, []
+
+
+def load_tokens(auto_refresh=True):
+    try:
+        with open(TOKENS_FILE, "r", encoding="utf-8") as f:
             tokens = json.load(f)
-        return tokens
+        if isinstance(tokens, list) and tokens:
+            return tokens
+        raise ValueError("tokens.json is empty or invalid")
     except Exception as e:
         app.logger.error(f"Error loading tokens: {e}")
+        if auto_refresh:
+            ok, count, total, failed_uids = refresh_tokens_from_uidpass()
+            if ok:
+                app.logger.info(
+                    f"Auto-refreshed tokens.json from uidpass.json. total={total} valid={count} failed={len(failed_uids)}"
+                )
+                return load_tokens(auto_refresh=False)
+            app.logger.error(
+                f"Token auto-refresh did not produce valid tokens. total={total} failed={len(failed_uids)}"
+            )
         return None
 
 def encrypt_message(plaintext):
