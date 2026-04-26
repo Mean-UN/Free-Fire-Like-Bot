@@ -45,7 +45,10 @@ if not BOT_TOKEN:
     logger.error("❌ BOT_TOKEN not found! Please set your bot token in environment variables.")
     sys.exit(1)
 
-REQUIRED_CHANNELS = ["Free Fire Like Bot🇰🇭"]
+CHANNELS = [
+    {"username": "@freefirelikebotcambodia", "name": "Free Fire Like Bot🇰🇭"}
+]
+REQUIRED_CHANNELS = [item["username"] for item in CHANNELS]
 GROUP_JOIN_LINK = "https://t.me/freefirelikebotcambodia"
 OWNER_ID = 1126297297
 OWNER_USERNAME = "@mean_un"
@@ -90,6 +93,15 @@ def is_user_in_channel(user_id):
     except Exception as e:
         logger.error(f"Join check failed: {e}")
         return False
+
+
+def build_join_markup():
+    markup = InlineKeyboardMarkup()
+    for item in CHANNELS:
+        username = item["username"].lstrip("@")
+        group_name = item.get("name", item["username"])
+        markup.add(InlineKeyboardButton(f"\U0001F517 Join {group_name}", url=f"https://t.me/{username}"))
+    return markup
 
 
 def call_api(region, uid):
@@ -216,9 +228,7 @@ def webhook():
 def start_command(message):
     user_id = message.from_user.id
     if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(InlineKeyboardButton(f"🔗 Join {channel}", url=f"https://t.me/{channel.strip('@')}") )
+        markup = build_join_markup()
         bot.reply_to(message, "📢 Channel Membership Required\nTo use this bot, you must join all our channels first", reply_markup=markup, parse_mode="Markdown")
         return
     if user_id not in like_tracker:
@@ -240,9 +250,7 @@ def handle_like(message):
         return
 
     if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(InlineKeyboardButton(f"🔗 Join {channel}", url=f"https://t.me/{channel.strip('@')}") )
+        markup = build_join_markup()
         bot.reply_to(message, "❌ You must join all our channels to use this command.", reply_markup=markup, parse_mode="Markdown")
         return
 
@@ -414,9 +422,7 @@ def help_command(message):
 
     # For regular users, check channel membership first
     if not is_user_in_channel(user_id):
-        markup = InlineKeyboardMarkup()
-        for channel in REQUIRED_CHANNELS:
-            markup.add(InlineKeyboardButton(f"🔗 Join {channel}", url=f"https://t.me/{channel.strip('@')}") )
+        markup = build_join_markup()
         bot.reply_to(message, "❌ You must join all our channels to use this command.", reply_markup=markup, parse_mode="Markdown")
         return
 
