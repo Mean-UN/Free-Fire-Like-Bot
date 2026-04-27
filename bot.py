@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 import sys
@@ -304,6 +304,20 @@ def process_like(message, region, uid):
         return
 
     try:
+        # Validate response contains required fields
+        if "UID" not in response or "PlayerNickname" not in response or "LikesGivenByAPI" not in response:
+            error_msg = f"I can't decode your info. Response missing required fields: {response}"
+            logger.error(error_msg)
+            try:
+                bot.edit_message_text(
+                    text="Error: Failed to decode player information. Please try again.",
+                    chat_id=processing_msg.chat.id,
+                    message_id=processing_msg.message_id,
+                )
+            except Exception:
+                bot.reply_to(message, "Error: Failed to decode player information. Please try again.")
+            return
+        
         player_uid = str(response.get("UID", uid)).strip()
         player_name = str(response.get("PlayerNickname", "N/A")).strip()
         region_name = str(response.get("Region", region)).strip()
@@ -334,7 +348,14 @@ def process_like(message, region, uid):
         )
     except Exception as e:
         logger.error(f"Error in process_like: {e}")
-        bot.reply_to(message, "Something went wrong while sending likes. The API responded, but output formatting failed.")
+        try:
+            bot.edit_message_text(
+                text="Something went wrong. Please try again later.",
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+            )
+        except Exception:
+            bot.reply_to(message, "Something went wrong. Please try again later.")
 
 
 @bot.message_handler(commands=["remain", "uidpass", "adduidpass"])
@@ -404,10 +425,7 @@ def help_command(message):
         bot.reply_to(message, help_text)
         return
 
-    if not is_user_in_channel(user_id):
-        bot.reply_to(message, "You must join all our channels to use this command.", reply_markup=build_join_markup())
-        return
-
+    # Allow help command even for users not in channel (but show join message)
     help_text = (
         "Bot Commands:\n\n"
         "/like <region> <uid> - Send likes to Free Fire UID\n"
@@ -417,6 +435,9 @@ def help_command(message):
         "Join our channels for updates."
     )
     bot.reply_to(message, help_text)
+    
+    if not is_user_in_channel(user_id):
+        bot.reply_to(message, "To use the /like command, you must join all our channels.", reply_markup=build_join_markup())
 
 
 @bot.message_handler(func=lambda message: True, content_types=["text"])

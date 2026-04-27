@@ -175,6 +175,11 @@ def make_request(encrypt, server_name, token):
             url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
         else:
             url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+        
+        if not encrypt:
+            app.logger.error("Invalid encrypt parameter (empty or None)")
+            return None
+            
         edata = bytes.fromhex(encrypt)
         headers = {
             'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -188,12 +193,21 @@ def make_request(encrypt, server_name, token):
             'ReleaseVersion': "OB53"
         }
         response = requests.post(url, data=edata, headers=headers, verify=False)
+        
+        if response.status_code != 200:
+            app.logger.error(f"Server returned status {response.status_code}: {response.text[:100]}")
+            return None
+            
         hex_data = response.content.hex()
         binary = bytes.fromhex(hex_data)
         decode = decode_protobuf(binary)
         if decode is None:
             app.logger.error("Protobuf decoding returned None.")
+            return None
         return decode
+    except ValueError as e:
+        app.logger.error(f"Error converting encrypt to hex: {e}")
+        return None
     except Exception as e:
         app.logger.error(f"Error in make_request: {e}")
         return None
