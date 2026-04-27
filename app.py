@@ -295,8 +295,8 @@ def handle_requests():
         data_after = json.loads(MessageToJson(after))
         account_info = data_after.get('AccountInfo', {})
         after_like = int(account_info.get('Likes', 0) or 0)
-        player_uid = int(account_info.get('UID', 0) or 0)
-        player_name = str(account_info.get('PlayerNickname', ''))
+        player_uid = str(account_info.get('UID', uid) or uid)  # Keep as string
+        player_name = str(account_info.get('PlayerNickname', 'Unknown')).strip()
         
         like_given = after_like - before_like
         

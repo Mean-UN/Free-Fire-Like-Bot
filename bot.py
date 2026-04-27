@@ -304,26 +304,13 @@ def process_like(message, region, uid):
         return
 
     try:
-        # Validate response contains required fields
-        if "UID" not in response or "PlayerNickname" not in response or "LikesGivenByAPI" not in response:
-            error_msg = f"I can't decode your info. Response missing required fields: {response}"
-            logger.error(error_msg)
-            try:
-                bot.edit_message_text(
-                    text="Error: Failed to decode player information. Please try again.",
-                    chat_id=processing_msg.chat.id,
-                    message_id=processing_msg.message_id,
-                )
-            except Exception:
-                bot.reply_to(message, "Error: Failed to decode player information. Please try again.")
-            return
-        
-        player_uid = str(response.get("UID", uid)).strip()
-        player_name = str(response.get("PlayerNickname", "N/A")).strip()
-        region_name = str(response.get("Region", region)).strip()
-        likes_before = str(response.get("LikesbeforeCommand", "N/A"))
-        likes_after = str(response.get("LikesafterCommand", "N/A"))
-        likes_given = str(response.get("LikesGivenByAPI", "N/A"))
+        # Extract player info with safe defaults
+        player_uid = str(response.get("UID") or uid).strip()
+        player_name = str(response.get("PlayerNickname") or "Unknown").strip()
+        region_name = str(response.get("Region") or region).strip()
+        likes_before = str(response.get("LikesbeforeCommand") or 0)
+        likes_after = str(response.get("LikesafterCommand") or 0)
+        likes_given = str(response.get("LikesGivenByAPI") or 0)
 
         usage["used"] += 1
         usage["last_used"] = now_utc
