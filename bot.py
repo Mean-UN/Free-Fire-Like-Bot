@@ -304,6 +304,9 @@ def process_like(message, region, uid):
         return
 
     try:
+        # Log the full response for debugging
+        logger.info(f"API Response for UID {uid}: {response}")
+        
         # Extract player info with safe defaults
         player_uid = str(response.get("UID") or uid).strip()
         player_name = str(response.get("PlayerNickname") or "Unknown").strip()
@@ -317,15 +320,15 @@ def process_like(message, region, uid):
         like_tracker[user_id] = usage
 
         response_text = (
-            "Request processed successfully\n\n"
-            f"Name: {player_name}\n"
-            f"UID: {player_uid}\n"
-            f"Region: {region_name}\n"
-            f"Likes Before: {likes_before}\n"
-            f"Likes Added: {likes_given}\n"
-            f"Total Likes Now: {likes_after}\n"
-            f"Remaining Requests: {max_limit - usage['used']}\n"
-            "Credit: @Mean_Un"
+            "✅ Request processed successfully\n\n"
+            f"👤 Name: {player_name}\n"
+            f"🆔 UID: {player_uid}\n"
+            f"🌍 Region: {region_name}\n"
+            f"❤️ Likes Before: {likes_before}\n"
+            f"➕ Likes Added: {likes_given}\n"
+            f"⭐ Total Likes Now: {likes_after}\n"
+            f"📊 Remaining Requests: {max_limit - usage['used']}\n"
+            "\n🔗 Credit: @Mean_Un"
         )
 
         bot.edit_message_text(
@@ -334,15 +337,16 @@ def process_like(message, region, uid):
             message_id=processing_msg.message_id,
         )
     except Exception as e:
-        logger.error(f"Error in process_like: {e}")
+        logger.error(f"Error in process_like: {e}", exc_info=True)
+        error_msg = f"❌ Error: {str(e)[:100]}"
         try:
             bot.edit_message_text(
-                text="Something went wrong. Please try again later.",
+                text=error_msg,
                 chat_id=processing_msg.chat.id,
                 message_id=processing_msg.message_id,
             )
         except Exception:
-            bot.reply_to(message, "Something went wrong. Please try again later.")
+            bot.reply_to(message, error_msg)
 
 
 @bot.message_handler(commands=["remain", "uidpass", "adduidpass"])

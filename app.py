@@ -311,7 +311,7 @@ def handle_requests():
             "status": 1 if like_given > 0 else 2
         })
     except Exception as e:
-        app.logger.error(f"Error processing request: {e}")
+        app.logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
