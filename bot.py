@@ -349,7 +349,7 @@ def process_like(message, region, uid):
             bot.reply_to(message, error_msg)
 
 
-@bot.message_handler(commands=["remain", "uidpass", "adduidpass"])
+@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "addremain"])
 def owner_commands(message):
     if message.from_user.id != OWNER_ID:
         return
@@ -388,6 +388,38 @@ def owner_commands(message):
             return
 
         updated, total = add_uidpass_entry(uid, password)
+        ok, count, _, failed_uids = refresh_tokens_from_uidpass()
+        action = "updated" if updated else "added"
+        status = "OK" if ok else "WARN"
+        bot.reply_to(
+            message,
+            f"{status}: UID {uid} {action}. UID/PASS total: {total} | Valid tokens now: {count} | Failed: {len(failed_uids)}",
+        )
+        return
+
+    if cmd == "/addremain":
+        if len(args) != 3:
+            bot.reply_to(message, "Use: /addremain <userid> <n>\nExample: /addremain 123456789 5")
+            return
+
+        try:
+            user_id = int(args[1])
+            n = int(args[2])
+        except ValueError:
+            bot.reply_to(message, "User ID and N must be numbers.")
+            return
+
+        if n < 0:
+            bot.reply_to(message, "N cannot be negative.")
+            return
+
+        # Update the user's daily limit
+        if user_id not in like_tracker:
+            like_tracker[user_id] = {"used": 0, "last_used": datetime.utcnow() - timedelta(days=1)}
+        
+        like_tracker[user_id]["used"] = max(0, get_user_limit(user_id) - n)
+        bot.reply_to(message, f"✅ User {user_id}: Remaining requests set to {n}")
+        return
         ok, count, _, failed_uids = refresh_tokens_from_uidpass()
         action = "updated" if updated else "added"
         status = "OK" if ok else "WARN"
@@ -436,7 +468,7 @@ def reply_all(message):
     if not message.text.startswith("/"):
         return
 
-    known_commands = {"/start", "/like", "/help", "/remain", "/uidpass", "/adduidpass"}
+    known_commands = {"/start", "/like", "/help", "/remain", "/uidpass", "/adduidpass", "/addremain"}
     command = message.text.split()[0].split("@")[0].lower()
     if command not in known_commands:
         bot.reply_to(message, "Unknown command. Use /help to see available commands.")
