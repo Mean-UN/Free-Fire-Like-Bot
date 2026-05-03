@@ -13,12 +13,18 @@ import like_count_pb2
 import uid_generator_pb2
 from google.protobuf.message import DecodeError
 import base64
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
 TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
+UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
+FFINFO_API_URL = os.getenv("FFINFO_API_URL", "").strip()
+FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 
 def refresh_tokens_from_uidpass():
     try:
@@ -79,6 +85,55 @@ def load_tokens(auto_refresh=True):
             )
         return None
 
+def refresh_and_load_tokens():
+    ok, count, total, failed_uids = refresh_tokens_from_uidpass()
+    if not ok:
+        app.logger.error(
+            f"Token refresh failed. total={total} valid={count} failed={len(failed_uids)}"
+        )
+        return None
+    app.logger.info(
+        f"Refreshed tokens.json from uidpass.json. total={total} valid={count} failed={len(failed_uids)}"
+    )
+    return load_tokens(auto_refresh=False)
+
+def get_region_from_token(token):
+    try:
+        payload = token.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        decoded_payload = base64.urlsafe_b64decode(payload).decode('utf-8')
+        parsed_payload = json.loads(decoded_payload)
+        return parsed_payload.get('lock_region', '').upper()
+    except Exception as e:
+        app.logger.error(f"Error decoding token payload: {e}")
+        return ""
+
+def fetch_external_ffinfo(uid, server_name):
+    if not FFINFO_API_URL:
+        return None
+
+    try:
+        headers = {}
+        params = {"uid": uid}
+        if server_name:
+            params["region"] = server_name.lower()
+        if FFINFO_API_KEY:
+            headers["x-api-key"] = FFINFO_API_KEY
+
+        response = requests.get(
+            FFINFO_API_URL,
+            params=params,
+            headers=headers,
+            timeout=UPSTREAM_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            app.logger.error(f"FF info API returned {response.status_code}: {response.text[:180]}")
+            return None
+        return response.json()
+    except Exception as e:
+        app.logger.error(f"External FF info request failed: {e}")
+        return None
+
 def encrypt_message(plaintext):
     try:
         key = b'Yg&tc%DEuh6%Zc^8'
@@ -115,10 +170,12 @@ async def send_request(encrypted_uid, token, url):
             'X-GA': "v1 1",
             'ReleaseVersion': "OB53"
         }
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, data=edata, headers=headers) as response:
                 if response.status != 200:
-                    app.logger.error(f"Request failed with status code: {response.status}")
+                    body = await response.text()
+                    app.logger.error(f"Like request failed with status {response.status}: {body[:100]}")
                     return response.status
                 return await response.text()
     except Exception as e:
@@ -192,7 +249,13 @@ def make_request(encrypt, server_name, token):
             'X-GA': "v1 1",
             'ReleaseVersion': "OB53"
         }
-        response = requests.post(url, data=edata, headers=headers, verify=False)
+        response = requests.post(
+            url,
+            data=edata,
+            headers=headers,
+            verify=False,
+            timeout=UPSTREAM_TIMEOUT_SECONDS,
+        )
         
         if response.status_code != 200:
             app.logger.error(f"Server returned status {response.status_code}: {response.text[:100]}")
@@ -250,14 +313,7 @@ def handle_requests():
         # Extract server_name (lock_region) from token if not provided
         server_name = request.args.get("server_name", "").upper()
         if not server_name:
-            try:
-                payload = token.split('.')[1]
-                payload += '=' * (-len(payload) % 4)
-                decoded_payload = base64.urlsafe_b64decode(payload).decode('utf-8')
-                parsed_payload = json.loads(decoded_payload)
-                server_name = parsed_payload.get('lock_region', '').upper()
-            except Exception as e:
-                app.logger.error(f"Error decoding token payload: {e}")
+            server_name = get_region_from_token(token)
         
         if not server_name:
             return jsonify({"error": "server_name could not be determined from token or input"}), 400
@@ -269,7 +325,14 @@ def handle_requests():
         # Get before likes count
         before = make_request(encrypted_uid, server_name, token)
         if before is None:
-            return jsonify({"error": "Failed to retrieve player info. There are no valid token found! please update tokens.json with valid tokens"}), 500
+            app.logger.info("Player info failed before likes. Refreshing tokens and retrying once.")
+            tokens = refresh_and_load_tokens()
+            if tokens is None or not tokens:
+                return jsonify({"error": "Token expired and auto-refresh failed. Check uidpass.json."}), 500
+            token = tokens[0]['token']
+            before = make_request(encrypted_uid, server_name, token)
+            if before is None:
+                return jsonify({"error": "Failed to retrieve player info. There are no valid token found! please update tokens.json with valid tokens"}), 500
         
         data_before = json.loads(MessageToJson(before))
         before_like = int(data_before.get('AccountInfo', {}).get('Likes', 0) or 0)
@@ -286,11 +349,20 @@ def handle_requests():
         # Send like requests
         requests_sent = asyncio.run(send_multiple_requests(uid, server_name, url))
         app.logger.info(f"Requests sent: {requests_sent}")
+        if requests_sent is None:
+            return jsonify({"error": "Failed to send like requests."}), 500
 
         # Get after likes count
         after = make_request(encrypted_uid, server_name, token)
         if after is None:
-            return jsonify({"error": "Failed to retrieve player info after likes."}), 500
+            app.logger.info("Player info failed after likes. Refreshing tokens and retrying once.")
+            tokens = refresh_and_load_tokens()
+            if tokens is None or not tokens:
+                return jsonify({"error": "Token expired and auto-refresh failed after likes. Check uidpass.json."}), 500
+            token = tokens[0]['token']
+            after = make_request(encrypted_uid, server_name, token)
+            if after is None:
+                return jsonify({"error": "Failed to retrieve player info after likes."}), 500
         
         data_after = json.loads(MessageToJson(after))
         account_info = data_after.get('AccountInfo', {})
@@ -314,5 +386,67 @@ def handle_requests():
         app.logger.error(f"Error processing request: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
+@app.route('/ffinfo', methods=['GET'])
+def handle_ffinfo():
+    uid = request.args.get("uid")
+    if not uid:
+        return jsonify({"error": "UID is required"}), 400
+
+    try:
+        tokens = load_tokens()
+        if tokens is None or not tokens:
+            return jsonify({"error": "Failed to load tokens."}), 500
+
+        token = tokens[0]['token']
+        server_name = request.args.get("server_name", "").upper()
+        if not server_name:
+            server_name = get_region_from_token(token)
+        if not server_name:
+            return jsonify({"error": "server_name could not be determined from token or input"}), 400
+
+        external_data = fetch_external_ffinfo(uid, server_name)
+        if external_data:
+            return jsonify({
+                "source": "external",
+                "Region": server_name,
+                "data": external_data,
+                "status": 1,
+            })
+
+        encrypted_uid = enc(uid)
+        if encrypted_uid is None:
+            return jsonify({"error": "Encryption of UID failed."}), 500
+
+        player_info = make_request(encrypted_uid, server_name, token)
+        if player_info is None:
+            app.logger.info("FF info failed. Refreshing tokens and retrying once.")
+            tokens = refresh_and_load_tokens()
+            if tokens is None or not tokens:
+                return jsonify({"error": "Token expired and auto-refresh failed. Check uidpass.json."}), 500
+            token = tokens[0]['token']
+            player_info = make_request(encrypted_uid, server_name, token)
+            if player_info is None:
+                return jsonify({"error": "Failed to retrieve player info after token refresh."}), 500
+
+        data = json.loads(MessageToJson(player_info))
+        account_info = data.get('AccountInfo', {})
+        return jsonify({
+            "source": "local",
+            "Region": server_name,
+            "data": {
+                "basicInfo": {
+                    "accountId": str(account_info.get('UID', uid) or uid),
+                    "nickname": str(account_info.get('PlayerNickname', 'Unknown')).strip(),
+                    "liked": int(account_info.get('Likes', 0) or 0),
+                    "region": server_name,
+                }
+            },
+            "status": 1,
+        })
+    except Exception as e:
+        app.logger.error(f"Error processing ffinfo request: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False)
+    port = int(os.getenv("PORT", "5001"))
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
