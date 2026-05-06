@@ -1,11 +1,18 @@
 import requests
 import json
+import os
 
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
 API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 
 def read_uidpass():
+    uid = os.getenv("FREEFIRE_UID", "").strip()
+    password = os.getenv("FREEFIRE_PASSWORD", "").strip()
+
+    if uid and password:
+        return [{"uid": uid, "password": password}]
+
     with open(UIDPASS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
