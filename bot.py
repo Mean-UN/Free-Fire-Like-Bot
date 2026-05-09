@@ -391,6 +391,7 @@ def build_ffinfo_text(payload, requester):
     last_login = pick(basic, "lastLoginAt", "lastLogin", "AccountLastLogin")
     br_rank = pick(basic, "rank", "BrRank", "maxRank", "BrMaxRank")
     br_points = pick(basic, "rankingPoints", "BrRankPoint")
+    br_stars = min(max((to_int(br_rank) or 0) - 320, 0), 5) if to_int(br_rank) and to_int(br_rank) >= 321 else None
     cs_rank = pick(basic, "csRank", "CsRank", "csMaxRank", "CsMaxRank")
     cs_points = pick(basic, "csRankingPoints", "CsRankPoint", "csRankPoint")
     cs_stars = cs_visible_stars(cs_rank, cs_points)
@@ -438,13 +439,14 @@ def build_ffinfo_text(payload, requester):
             "🏆 BATTLE ROYALE\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🥇 Rank: {rank_name(br_rank, br_points, mode='br')}\n"
+            f"⭐ Stars: {format_number(br_stars)}\n"
             f"📊 Points: {format_number(br_points)}"
         ),
         (
             "⚔️ CLASH SQUAD\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🥈 Rank: {rank_name(cs_rank, cs_points, mode='cs')}\n"
-            f"⭐ Total Stars: {format_number(cs_points)}"
+            f"⭐ Stars: {format_number(cs_stars)} (Total: {format_number(cs_points)})"
         ),
     ]
 
@@ -464,9 +466,12 @@ def build_ffinfo_text(payload, requester):
             f"🆔 Captain UID: {format_number(captain_uid)}"
         )
 
-    has_captain = has_clan and any(
-        pick(captain, key, default=None) not in (None, "", "N/A")
-        for key in ("accountId", "AccountId", "nickname", "AccountName")
+    has_captain = has_clan and (
+        captain_uid not in (None, "", "N/A")
+        or any(
+            pick(captain, key, default=None) not in (None, "", "N/A")
+            for key in ("accountId", "AccountId", "nickname", "AccountName")
+        )
     )
     if has_captain:
         sections.append(
@@ -479,7 +484,7 @@ def build_ffinfo_text(payload, requester):
             f"💙 Likes: {format_number(captain_likes)}\n"
             f"🏆 BR Rank: {rank_name(captain_br_rank, captain_br_points, mode='br')}\n"
             f"⚔️ CS Rank: {rank_name(captain_cs_rank, captain_cs_points, mode='cs')}\n"
-            f"⭐ CS Total Stars: {format_number(captain_cs_points)}\n"
+            f"⭐ CS Stars: {format_number(captain_cs_stars)} (Total: {format_number(captain_cs_points)})\n"
             f"⏱ Last Login: {format_unix_date(captain_last_login)}"
         )
 
