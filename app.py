@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify
 import asyncio
 import os
+import threading
+import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
@@ -23,8 +25,15 @@ TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
 TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
-FFINFO_API_URL = os.getenv("FFINFO_API_URL", "").strip()
+FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info-ob49.onrender.com/api/account/").strip()
 FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
+AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
+ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
+FFINFO_DEFAULT_REGIONS = [
+    region.strip().upper()
+    for region in os.getenv("FFINFO_DEFAULT_REGIONS", "SG,IND,BD,BR,US,SAC,NA,EU,ME,TH,VN,ID,TW,RU").split(",")
+    if region.strip()
+]
 
 def read_uidpass_records():
     uid = os.getenv("FREEFIRE_UID", "").strip()
@@ -106,6 +115,19 @@ def refresh_and_load_tokens():
     )
     return load_tokens(auto_refresh=False)
 
+def auto_refresh_tokens_loop():
+    interval_seconds = max(300, int(AUTO_TOKEN_REFRESH_HOURS * 60 * 60))
+    while True:
+        try:
+            app.logger.info(f"Auto token refresh running. interval_hours={AUTO_TOKEN_REFRESH_HOURS}")
+            refresh_and_load_tokens()
+        except Exception as e:
+            app.logger.error(f"Scheduled token refresh failed: {e}")
+        time.sleep(interval_seconds)
+
+if ENABLE_AUTO_TOKEN_REFRESH:
+    threading.Thread(target=auto_refresh_tokens_loop, daemon=True).start()
+
 def get_region_from_token(token):
     try:
         payload = token.split('.')[1]
@@ -123,6 +145,12 @@ def normalize_region(region):
         return "EUROPE"
     return region
 
+def ffinfo_api_region(region):
+    region = str(region or "").strip().upper()
+    if region == "EUROPE":
+        return "eu"
+    return region.lower()
+
 def token_region(token_item):
     token = token_item.get("token", "") if isinstance(token_item, dict) else str(token_item)
     return normalize_region(get_region_from_token(token))
@@ -139,29 +167,41 @@ def select_token_for_region(tokens, server_name):
 
 def fetch_external_ffinfo(uid, server_name):
     if not FFINFO_API_URL:
-        return None
+        return None, "", {"error": "FFINFO_API_URL is disabled"}
 
-    try:
+    regions = [server_name] if server_name else FFINFO_DEFAULT_REGIONS
+    last_error = {"error": "No region returned data"}
+    for region in regions:
         headers = {}
-        params = {"uid": uid}
-        if server_name:
-            params["region"] = server_name.lower()
+        params = {"uid": uid, "region": ffinfo_api_region(region)}
         if FFINFO_API_KEY:
             headers["x-api-key"] = FFINFO_API_KEY
 
-        response = requests.get(
-            FFINFO_API_URL,
-            params=params,
-            headers=headers,
-            timeout=UPSTREAM_TIMEOUT_SECONDS,
-        )
-        if response.status_code != 200:
-            app.logger.error(f"FF info API returned {response.status_code}: {response.text[:180]}")
-            return None
-        return response.json()
-    except Exception as e:
-        app.logger.error(f"External FF info request failed: {e}")
-        return None
+        try:
+            response = requests.get(
+                FFINFO_API_URL,
+                params=params,
+                headers=headers,
+                timeout=UPSTREAM_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                last_error = {
+                    "region": normalize_region(region),
+                    "status_code": response.status_code,
+                    "body": response.text[:180],
+                }
+                app.logger.info(
+                    f"FF info API returned {response.status_code} for region {region}: {response.text[:180]}"
+                )
+                continue
+            data = response.json()
+            basic_info = data.get("basicInfo", {}) if isinstance(data, dict) else {}
+            resolved_region = normalize_region(basic_info.get("region") or region)
+            return data, resolved_region, None
+        except Exception as e:
+            last_error = {"region": normalize_region(region), "error": str(e)}
+            app.logger.info(f"External FF info request failed for region {region}: {e}")
+    return None, "", last_error
 
 def encrypt_message(plaintext):
     try:
@@ -444,11 +484,26 @@ def handle_ffinfo():
         return jsonify({"error": "UID is required"}), 400
 
     try:
+        server_name = request.args.get("server_name", "").upper()
+
+        external_data, resolved_region, external_error = fetch_external_ffinfo(uid, normalize_region(server_name))
+        if external_data:
+            return jsonify({
+                "source": "external",
+                "Region": resolved_region,
+                "data": external_data,
+                "status": 1,
+            })
+        if server_name:
+            return jsonify({
+                "error": f"Full ffinfo API did not return data for region {normalize_region(server_name)}.",
+                "details": external_error,
+            }), 502
+
         tokens = load_tokens()
         if tokens is None or not tokens:
-            return jsonify({"error": "Failed to load tokens."}), 500
+            return jsonify({"error": "Failed to load tokens and full ffinfo API did not return data."}), 500
 
-        server_name = request.args.get("server_name", "").upper()
         if not server_name:
             token = tokens[0]['token']
             server_name = get_region_from_token(token)
@@ -464,18 +519,9 @@ def handle_ffinfo():
             if token is None:
                 available_regions = sorted({token_region(item) for item in (tokens or []) if token_region(item)})
                 return jsonify({
-                    "error": f"No valid token found for region {server_name}. Add a {server_name} UID/password in uidpass.json and refresh tokens.",
+                    "error": f"Full ffinfo API did not return data, and no local token exists for region {server_name}.",
                     "available_regions": available_regions,
                 }), 500
-
-        external_data = fetch_external_ffinfo(uid, server_name)
-        if external_data:
-            return jsonify({
-                "source": "external",
-                "Region": server_name,
-                "data": external_data,
-                "status": 1,
-            })
 
         encrypted_uid = enc(uid)
         if encrypted_uid is None:

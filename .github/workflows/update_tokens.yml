@@ -1,25 +1,29 @@
-# .github/workflows/update_tokens.yml
 name: Update Tokens
 
 on:
   schedule:
-    - cron: '0 */7 * * *'  # প্রতি ৭ ঘণ্টা পরপর
-  workflow_dispatch:  # ম্যানুয়ালি রান করার অপশন
+    - cron: "0 */7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-tokens
+  cancel-in-progress: false
 
 jobs:
   update-tokens:
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: "3.x"
 
       - name: Install dependencies
         run: |
@@ -31,9 +35,13 @@ jobs:
 
       - name: Commit and push if changed
         run: |
-          git config --global user.email "action@github.com"
-          git config --global user.name "GitHub Action"
-          git add tokens.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Update tokens [automated]" && git push)
-          git pull --rebase origin main
-          git push origin main
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add -f tokens.json
+          if git diff --cached --quiet; then
+            echo "tokens.json unchanged"
+          else
+            git commit -m "Update tokens [automated]"
+            git pull --rebase
+            git push
+          fi

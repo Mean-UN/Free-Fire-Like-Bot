@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "90"))
+AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
+ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN not found. Set BOT_TOKEN in environment variables.")
@@ -108,7 +110,18 @@ def call_api(region, uid):
             timeout=API_TIMEOUT_SECONDS,
         )
         if response.status_code != 200:
-            return {"error": f"API returned {response.status_code}: {response.text[:180]}"}
+            try:
+                payload = response.json()
+                return {
+                    "error": payload.get("error") or "Like request could not be completed.",
+                    "available_regions": payload.get("available_regions"),
+                    "status_code": response.status_code,
+                }
+            except ValueError:
+                return {
+                    "error": "Like request could not be completed.",
+                    "status_code": response.status_code,
+                }
         return response.json()
     except requests.exceptions.ConnectionError as e:
         logger.error(f"API connection failed: {e}")
@@ -123,6 +136,30 @@ def call_api(region, uid):
         return {"error": "Invalid JSON response from API."}
 
 
+def format_like_error(response, region, uid):
+    message = str(response.get("error", ""))
+    available_regions = response.get("available_regions") or []
+    status_code = response.get("status_code")
+
+    if "No valid token found for region" in message or available_regions:
+        available = ", ".join(available_regions) if available_regions else "none"
+        return (
+            "⚠️ Likes are not available for this region right now.\n\n"
+            f"🆔 UID: {uid}\n"
+            f"🌐 Requested Region: {region}\n"
+            f"✅ Available Token Regions: {available}\n\n"
+            "Please try a supported region or ask the owner to add a valid account for this region."
+        )
+
+    if "token expired" in message.lower() or "valid token" in message.lower():
+        return "⚠️ Like tokens are unavailable right now. Please try again later."
+
+    if status_code and status_code >= 500:
+        return "⚠️ The like service is temporarily unavailable. Please try again later."
+
+    return f"❌ Unable to send likes.\n\nReason: {message or 'Unknown error'}"
+
+
 def call_ffinfo_api(region, uid):
     url = f"{API_BASE_URL}/ffinfo"
     params = {"uid": uid}
@@ -132,7 +169,19 @@ def call_ffinfo_api(region, uid):
         logger.info(f"Calling FF info API: url={url} region={region or 'AUTO'} uid={uid}")
         response = requests.get(url, params=params, timeout=API_TIMEOUT_SECONDS)
         if response.status_code != 200:
-            return {"error": f"API returned {response.status_code}: {response.text[:180]}"}
+            try:
+                payload = response.json()
+                message = payload.get("error") or "Player information could not be fetched."
+                return {
+                    "error": message,
+                    "details": payload.get("details"),
+                    "status_code": response.status_code,
+                }
+            except ValueError:
+                return {
+                    "error": "Player information could not be fetched.",
+                    "status_code": response.status_code,
+                }
         return response.json()
     except requests.exceptions.ConnectionError as e:
         logger.error(f"FF info API connection failed: {e}")
@@ -145,6 +194,36 @@ def call_ffinfo_api(region, uid):
         return {"error": "API failed. Please try again later."}
     except ValueError:
         return {"error": "Invalid JSON response from API."}
+
+
+def format_ffinfo_error(response, region, uid):
+    status_code = response.get("status_code")
+    details = response.get("details") or {}
+    detail_status = details.get("status_code") if isinstance(details, dict) else None
+    requested_region = (region or "").upper()
+
+    if status_code in {404, 502} or detail_status in {404, 500, 502}:
+        if requested_region:
+            return (
+                "❌ Player profile not found\n\n"
+                f"🆔 UID: {uid}\n"
+                f"🌐 Region: {requested_region}\n\n"
+                "Please check that the UID and region are correct, then try again."
+            )
+        return (
+            "❌ Player profile not found\n\n"
+            f"🆔 UID: {uid}\n\n"
+            "I could not find this player in the supported regions. Try again with the region, for example:\n"
+            f"/ffinfo sg {uid}"
+        )
+
+    if status_code == 429:
+        return "⏳ The player info service is busy. Please try again in a few minutes."
+
+    if status_code and status_code >= 500:
+        return "⚠️ The player info service is temporarily unavailable. Please try again later."
+
+    return f"❌ Unable to fetch player profile.\n\nReason: {response.get('error', 'Unknown error')}"
 
 
 def pick(data, *paths, default="N/A"):
@@ -186,27 +265,105 @@ def clean_enum(value):
     return text.replace("_", " ")
 
 
-def rank_name(value):
+def to_int(value):
     try:
-        rank = int(value)
+        return int(value)
     except (TypeError, ValueError):
+        return None
+
+
+def roman_number(value):
+    numerals = {
+        1: "I",
+        2: "II",
+        3: "III",
+        4: "IV",
+        5: "V",
+        6: "VI",
+        7: "VII",
+        8: "VIII",
+        9: "IX",
+        10: "X",
+    }
+    return numerals.get(value, str(value))
+
+
+def star_label(count):
+    if count is None or count <= 0:
+        return ""
+    if count <= 5:
+        return " " + ("★" * count)
+    return f" ★{count}"
+
+
+def br_heroic_stars(points):
+    points = to_int(points)
+    if points is None or points < 3200:
+        return None
+    return max(1, min(5, (points - 3000) // 500))
+
+
+def cs_visible_stars(rank, points):
+    rank = to_int(rank)
+    points = to_int(points)
+    if points is None:
+        return None
+    if rank is not None and rank >= 321:
+        return max(0, points - 87)
+    return points
+
+
+def rank_name(value, points=None, mode="br"):
+    rank = to_int(value)
+    rank_points = to_int(points)
+    if rank is None:
         return str(value or "N/A")
 
-    if rank >= 322:
-        return "Elite Heroic"
-    if rank >= 312:
-        return "Heroic"
-    if rank >= 301:
+    if rank >= 326:
+        if mode == "br" and rank_points is not None and rank_points >= 8000:
+            return "Elite Master"
         return "Master"
+    if rank >= 321:
+        if mode == "br":
+            stars = min(max(rank - 320, 1), 5)
+            return f"Heroic{star_label(min(stars, 5))}"
+        cs_stars = cs_visible_stars(rank, rank_points)
+        if rank >= 323:
+            if cs_stars is not None and cs_stars >= 100:
+                return f"Elite Master{star_label(cs_stars)}"
+            return f"Master{star_label(cs_stars)}"
+        return f"Heroic{star_label(cs_stars)}"
+    if rank >= 318:
+        return "Master"
+    if rank >= 315:
+        return f"Diamond {roman_number(rank - 314)}"
+    if rank >= 311:
+        return f"Platinum {roman_number(rank - 310)}"
+    if rank >= 307:
+        return f"Gold {roman_number(rank - 306)}"
+    if rank >= 304:
+        return f"Silver {roman_number(rank - 303)}"
+    if rank >= 301:
+        return f"Bronze {roman_number(rank - 300)}"
     if rank >= 215:
-        return "Diamond"
+        return f"Diamond {roman_number(rank - 214)}"
     if rank >= 211:
-        return "Platinum"
+        return f"Platinum {roman_number(rank - 210)}"
+    if rank >= 207:
+        return f"Gold {roman_number(rank - 206)}"
+    if rank >= 204:
+        return f"Silver {roman_number(rank - 203)}"
     if rank >= 201:
-        return "Gold"
-    if rank >= 101:
-        return "Bronze"
+        return f"Bronze {roman_number(rank - 200)}"
     return str(rank)
+
+
+def format_percent(part, total):
+    part_num = to_int(part)
+    total_num = to_int(total)
+    if part_num is None or total_num in (None, 0):
+        return "N/A"
+    return f"{round((part_num / total_num) * 100)}%"
 
 
 def build_ffinfo_text(payload, requester):
@@ -216,6 +373,7 @@ def build_ffinfo_text(payload, requester):
 
     basic = pick(data, "basicInfo", "AccountInfo", default={})
     clan = pick(data, "clanBasicInfo", "GuildInfo", default={})
+    captain = pick(data, "captainBasicInfo", default={})
     profile = pick(data, "profileInfo", "AccountProfileInfo", default={})
     social = pick(data, "socialInfo", "socialinfo", default={})
     pet = pick(data, "petInfo", default={})
@@ -235,6 +393,19 @@ def build_ffinfo_text(payload, requester):
     br_points = pick(basic, "rankingPoints", "BrRankPoint")
     cs_rank = pick(basic, "csRank", "CsRank", "csMaxRank", "CsMaxRank")
     cs_points = pick(basic, "csRankingPoints", "CsRankPoint", "csRankPoint")
+    cs_stars = cs_visible_stars(cs_rank, cs_points)
+    clan_members = pick(clan, "memberNum", "GuildMember")
+    clan_capacity = pick(clan, "capacity", "GuildCapacity")
+    captain_uid = pick(clan, "captainId", "GuildOwner", "ownerId")
+    captain_name = pick(captain, "nickname", "AccountName", default="N/A")
+    captain_level = pick(captain, "level", "AccountLevel")
+    captain_likes = pick(captain, "liked", "AccountLikes")
+    captain_br_rank = pick(captain, "rank", "BrRank", "maxRank", "BrMaxRank")
+    captain_br_points = pick(captain, "rankingPoints", "BrRankPoint")
+    captain_cs_rank = pick(captain, "csRank", "CsRank", "csMaxRank", "CsMaxRank")
+    captain_cs_points = pick(captain, "csRankingPoints", "CsRankPoint", "csRankPoint")
+    captain_cs_stars = cs_visible_stars(captain_cs_rank, captain_cs_points)
+    captain_last_login = pick(captain, "lastLoginAt", "AccountLastLogin")
 
     equipped_skills = pick(profile, "equipedSkills", "equippedSkills", "EquippedSkills", default=[])
     if isinstance(equipped_skills, list):
@@ -246,61 +417,109 @@ def build_ffinfo_text(payload, requester):
 
     requested_at = datetime.now().strftime("%d %b %Y %H:%M:%S")
     requester_name = str(requester.first_name or requester.username or requester.id)
+    sections = [
+        (
+            "🎮 FREE FIRE PROFILE\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "👤 BASIC INFORMATION\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ Nickname: {nickname}\n"
+            f"🆔 UID: {uid}\n"
+            f"🌐 Region: {str(region).upper()}\n"
+            f"📈 Level: {format_number(level)}\n"
+            f"✨ EXP: {format_number(exp)}\n"
+            f"💙 Likes: {format_number(likes)}\n"
+            f"🎖 Badges: {format_number(badges)}\n"
+            f"🏅 Title ID: {format_number(title)}\n"
+            f"📆 Created: {format_unix_date(created)}\n"
+            f"⏱ Last Login: {format_unix_date(last_login)}"
+        ),
+        (
+            "🏆 BATTLE ROYALE\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🥇 Rank: {rank_name(br_rank, br_points, mode='br')}\n"
+            f"📊 Points: {format_number(br_points)}"
+        ),
+        (
+            "⚔️ CLASH SQUAD\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🥈 Rank: {rank_name(cs_rank, cs_points, mode='cs')}\n"
+            f"⭐ Total Stars: {format_number(cs_points)}"
+        ),
+    ]
 
-    return (
-        "🎮 PLAYER INFORMATION 🎮\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📋 BASIC INFORMATION\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Nickname: {nickname}\n"
-        f"🆔 UID: {uid}\n"
-        f"🌍 Region: {str(region).upper()}\n"
-        f"⭐ Level: {format_number(level)}\n"
-        f"📊 EXP: {format_number(exp)}\n"
-        f"❤️ Likes: {format_number(likes)}\n"
-        f"🎖️ Badges: {format_number(badges)}\n"
-        f"🏆 Title ID: {format_number(title)}\n"
-        f"📅 Created: {format_unix_date(created)}\n"
-        f"🕒 Last Login: {format_unix_date(last_login)}\n\n"
-        "🏆 BATTLE ROYALE RANK\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 Current Rank: {rank_name(br_rank)}\n"
-        f"📈 Ranking Points: {format_number(br_points)}\n\n"
-        "🔫 CLASH SQUAD RANK\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"⚡ Current Rank: {rank_name(cs_rank)}\n"
-        f"📊 CS Points: {format_number(cs_points)}\n\n"
-        "👥 CLAN INFORMATION\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🏰 Clan Name: {pick(clan, 'clanName', 'GuildName')}\n"
-        f"🔢 Clan ID: {format_number(pick(clan, 'clanId', 'Guildid', 'GuildID'))}\n"
-        f"⭐ Clan Level: {format_number(pick(clan, 'clanLevel', 'GuildLevel'))}\n"
-        f"👤 Members: {format_number(pick(clan, 'memberNum', 'GuildMember'))}/{format_number(pick(clan, 'capacity', 'GuildCapacity'))}\n"
-        f"👑 Captain UID: {format_number(pick(clan, 'captainId', 'GuildOwner', 'ownerId'))}\n\n"
-        "🎭 PROFILE SETTINGS\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🖼️ Avatar ID: {format_number(pick(profile, 'avatarId', 'AccountAvatarId'))}\n"
-        f"⚡ Equipped Skills: {format_number(equipped_skills)}\n\n"
-        "💬 SOCIAL INFORMATION\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📝 Bio: {pick(social, 'signature', 'AccountSignature', default='No bio')}\n"
-        f"🌐 Language: {clean_enum(pick(social, 'language', 'AccountLanguage'))}\n"
-        f"🔒 Privacy: {clean_enum(pick(social, 'privacy', 'AccountPrivacy'))}\n\n"
-        "🐾 PET INFORMATION\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 Pet ID: {format_number(pick(pet, 'id', 'PetId'))}\n"
-        f"⭐ Pet Level: {format_number(pick(pet, 'level', 'PetLevel'))}\n"
-        f"📈 Pet EXP: {format_number(pick(pet, 'exp', 'PetEXP'))}\n"
-        f"🎭 Skin ID: {format_number(pick(pet, 'skinId', 'SkinId'))}\n\n"
-        "💳 CREDIT SCORE\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"⭐ Score: {format_number(credit_score)}/100\n"
-        f"📊 Status: {credit_status}\n"
-        f"⏰ Valid Until: {format_unix_date(credit_valid)}\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Requested by: {requester_name}\n"
-        f"🕒 {requested_at}"
+    has_clan = any(
+        pick(clan, key, default=None) not in (None, "", "N/A")
+        for key in ("clanId", "Guildid", "GuildID", "clanName", "GuildName")
     )
+    if has_clan:
+        sections.append(
+            "🏰 CLAN INFORMATION\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ Name: {pick(clan, 'clanName', 'GuildName')}\n"
+            f"🆔 ID: {format_number(pick(clan, 'clanId', 'Guildid', 'GuildID'))}\n"
+            f"📈 Level: {format_number(pick(clan, 'clanLevel', 'GuildLevel'))}\n"
+            f"👥 Members: {format_number(clan_members)}/{format_number(clan_capacity)} ({format_percent(clan_members, clan_capacity)})\n"
+            f"👑 Captain: {captain_name}\n"
+            f"🆔 Captain UID: {format_number(captain_uid)}"
+        )
+
+    has_captain = has_clan and any(
+        pick(captain, key, default=None) not in (None, "", "N/A")
+        for key in ("accountId", "AccountId", "nickname", "AccountName")
+    )
+    if has_captain:
+        sections.append(
+            "👑 CAPTAIN INFORMATION\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🏷️ Name: {captain_name}\n"
+            f"🆔 UID: {format_number(pick(captain, 'accountId', 'AccountId', default=captain_uid))}\n"
+            f"🌐 Region: {str(pick(captain, 'region', 'AccountRegion', default='N/A')).upper()}\n"
+            f"📈 Level: {format_number(captain_level)}\n"
+            f"💙 Likes: {format_number(captain_likes)}\n"
+            f"🏆 BR Rank: {rank_name(captain_br_rank, captain_br_points, mode='br')}\n"
+            f"⚔️ CS Rank: {rank_name(captain_cs_rank, captain_cs_points, mode='cs')}\n"
+            f"⭐ CS Total Stars: {format_number(captain_cs_points)}\n"
+            f"⏱ Last Login: {format_unix_date(captain_last_login)}"
+        )
+
+    sections.extend([
+        (
+            "🎨 PROFILE STYLE\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🖼 Avatar ID: {format_number(pick(profile, 'avatarId', 'AccountAvatarId'))}\n"
+            f"⚡ Skills Equipped: {format_number(equipped_skills)}"
+        ),
+        (
+            "💬 SOCIAL\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"📝 Bio: {pick(social, 'signature', 'AccountSignature', default='No bio')}\n"
+            f"🌐 Language: {clean_enum(pick(social, 'language', 'AccountLanguage'))}\n"
+            f"🔐 Privacy: {clean_enum(pick(social, 'privacy', 'AccountPrivacy'))}"
+        ),
+        (
+            "🐾 PET INFORMATION\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 ID: {format_number(pick(pet, 'id', 'PetId'))}\n"
+            f"📈 Level: {format_number(pick(pet, 'level', 'PetLevel'))}\n"
+            f"✨ EXP: {format_number(pick(pet, 'exp', 'PetEXP'))}\n"
+            f"🎨 Skin ID: {format_number(pick(pet, 'skinId', 'SkinId'))}"
+        ),
+        (
+            "✅ CREDIT SCORE\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"💯 Score: {format_number(credit_score)}/100\n"
+            f"📌 Status: {credit_status}\n"
+            f"⏳ Valid Until: {format_unix_date(credit_valid)}"
+        ),
+        (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🙋 Requested by: {requester_name}\n"
+            f"🕒 Time: {requested_at}"
+        ),
+    ])
+
+    return "\n\n".join(sections)
 
 
 def build_local_ffinfo_text(payload, requester):
@@ -315,18 +534,18 @@ def build_local_ffinfo_text(payload, requester):
     requester_name = str(requester.first_name or requester.username or requester.id)
 
     return (
-        "🎮 PLAYER INFORMATION 🎮\n"
+        "🎮 FREE FIRE PROFILE\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "📋 BASIC INFORMATION\n"
+        "👤 BASIC INFORMATION\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Nickname: {nickname}\n"
+        f"🏷️ Nickname: {nickname}\n"
         f"🆔 UID: {uid}\n"
-        f"🌍 Region: {str(region).upper()}\n"
-        f"❤️ Likes: {format_number(likes)}\n\n"
-        "ℹ️ Full rank, clan, pet, bio, and credit score fields need a full FF info API key.\n\n"
+        f"🌐 Region: {str(region).upper()}\n"
+        f"💙 Likes: {format_number(likes)}\n\n"
+        "ℹ️ Full profile data is unavailable from the fallback local decoder.\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📡 Requested by: {requester_name}\n"
-        f"🕒 {requested_at}"
+        f"🙋 Requested by: {requester_name}\n"
+        f"🕒 Time: {requested_at}"
     )
 
 
@@ -402,7 +621,27 @@ def is_token_error(error_message):
     return any(marker in msg for marker in token_error_markers)
 
 
+def scheduled_token_refresh():
+    interval_seconds = max(300, int(AUTO_TOKEN_REFRESH_HOURS * 60 * 60))
+    while True:
+        try:
+            ok, count, total, failed_uids = refresh_tokens_from_uidpass()
+            if ok:
+                logger.info(
+                    f"Scheduled token refresh complete. total={total} valid={count} failed={len(failed_uids)}"
+                )
+            else:
+                logger.error(
+                    f"Scheduled token refresh failed. total={total} valid={count} failed={len(failed_uids)}"
+                )
+        except Exception as e:
+            logger.error(f"Scheduled token refresh crashed: {e}", exc_info=True)
+        time.sleep(interval_seconds)
+
+
 threading.Thread(target=reset_limits, daemon=True).start()
+if ENABLE_AUTO_TOKEN_REFRESH:
+    threading.Thread(target=scheduled_token_refresh, daemon=True).start()
 
 
 @app.route("/")
@@ -527,7 +766,7 @@ def process_ffinfo(message, region, uid):
         if "error" in response and auto_refreshed:
             response["error"] = f"{response['error']} (tokens auto-refreshed and retried once)"
 
-        text = f"API Error: {response['error']}"
+        text = format_ffinfo_error(response, region, uid)
         logger.error(f"FF info API error for uid={uid} region={region or 'AUTO'}: {response['error']}")
         try:
             bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
@@ -588,7 +827,7 @@ def process_like(message, region, uid):
         if "error" in response and auto_refreshed:
             response["error"] = f"{response['error']} (tokens auto-refreshed and retried once)"
 
-        text = f"API Error: {response['error']}"
+        text = format_like_error(response, region, uid)
         logger.error(f"Like API error for uid={uid} region={region}: {response['error']}")
         try:
             bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)

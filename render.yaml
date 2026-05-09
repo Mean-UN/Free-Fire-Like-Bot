@@ -4,12 +4,14 @@ services:
     name: free-fire-bot
     env: python
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    startCommand: "python bot.py"
     envVars:
       - key: BOT_TOKEN
         sync: false
       - key: WEBHOOK_URL
         sync: false
+      - key: AUTO_TOKEN_REFRESH_HOURS
+        value: "7"
     scaling:
       minInstances: 1
       maxInstances: 1

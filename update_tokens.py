@@ -1,6 +1,7 @@
 import requests
 import json
 import os
+import sys
 
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
@@ -19,7 +20,7 @@ def read_uidpass():
 def fetch_token(uid, password):
     url = f"{API_URL}?uid={uid}&password={password}"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
         data = response.json()
         return data.get("token")
@@ -40,9 +41,10 @@ def main():
             new_tokens.append({"token": token})
     if new_tokens:
         update_token_file(new_tokens)
-        print("tokens.json updated successfully.")
+        print(f"tokens.json updated successfully. valid={len(new_tokens)} total={len(uidpass_list)}")
     else:
         print("No tokens updated.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
