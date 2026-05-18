@@ -8,11 +8,32 @@ TOKEN_FILE = "tokens.json"
 API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 
 def read_uidpass():
+    uidpass_json = os.getenv("UIDPASS_JSON", "").strip()
     uid = os.getenv("FREEFIRE_UID", "").strip()
     password = os.getenv("FREEFIRE_PASSWORD", "").strip()
 
+    if uidpass_json:
+        try:
+            records = json.loads(uidpass_json)
+        except json.JSONDecodeError as e:
+            print(f"UIDPASS_JSON is not valid JSON: {e}")
+            sys.exit(1)
+        if isinstance(records, dict):
+            records = [records]
+        if not isinstance(records, list):
+            print("UIDPASS_JSON must be a JSON object or list.")
+            sys.exit(1)
+        return records
+
     if uid and password:
         return [{"uid": uid, "password": password}]
+
+    if not os.path.exists(UIDPASS_FILE):
+        print(
+            "uidpass.json not found. Add it locally, or set GitHub secret UIDPASS_JSON "
+            "with your UID/password JSON."
+        )
+        sys.exit(1)
 
     with open(UIDPASS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)

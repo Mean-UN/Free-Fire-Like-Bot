@@ -159,11 +159,28 @@ def select_tokens_for_region(tokens, server_name):
     requested_region = normalize_region(server_name)
     return [item for item in tokens if token_region(item) == requested_region]
 
+def order_tokens_for_region(tokens, server_name):
+    requested_region = normalize_region(server_name)
+    matching = []
+    others = []
+    for item in tokens:
+        if token_region(item) == requested_region:
+            matching.append(item)
+        else:
+            others.append(item)
+    return matching + others
+
 def select_token_for_region(tokens, server_name):
     matching_tokens = select_tokens_for_region(tokens, server_name)
     if matching_tokens:
         return matching_tokens[0]["token"]
     return None
+
+def first_token_value(tokens):
+    if not tokens:
+        return None
+    item = tokens[0]
+    return item.get("token") if isinstance(item, dict) else str(item)
 
 def fetch_external_ffinfo(uid, server_name):
     if not FFINFO_API_URL:
@@ -268,9 +285,9 @@ async def send_multiple_requests(uid, server_name, url, tokens=None):
         if tokens is None:
             app.logger.error("Failed to load tokens.")
             return None
-        tokens = select_tokens_for_region(tokens, server_name)
+        tokens = order_tokens_for_region(tokens, server_name)
         if not tokens:
-            app.logger.error(f"No tokens found for region {server_name}.")
+            app.logger.error("No tokens found.")
             return None
         for i in range(100):
             token = tokens[i % len(tokens)]["token"]
@@ -400,10 +417,15 @@ def handle_requests():
             token = select_token_for_region(tokens or [], server_name)
             if token is None:
                 available_regions = sorted({token_region(item) for item in (tokens or []) if token_region(item)})
-                return jsonify({
-                    "error": f"No valid token found for region {server_name}. Add a {server_name} UID/password in uidpass.json and refresh tokens.",
-                    "available_regions": available_regions,
-                }), 500
+                token = first_token_value(tokens or [])
+                if token is None:
+                    return jsonify({
+                        "error": f"No valid token found for region {server_name}. Add a {server_name} UID/password in uidpass.json and refresh tokens.",
+                        "available_regions": available_regions,
+                    }), 500
+                app.logger.info(
+                    f"No exact token for {server_name}. Using fallback token from available regions: {available_regions}"
+                )
         
         encrypted_uid = enc(uid)
         if encrypted_uid is None:
@@ -418,7 +440,9 @@ def handle_requests():
                 return jsonify({"error": "Token expired and auto-refresh failed. Check uidpass.json."}), 500
             token = select_token_for_region(tokens, server_name)
             if token is None:
-                return jsonify({"error": f"Token refresh succeeded, but no token exists for region {server_name}."}), 500
+                token = first_token_value(tokens)
+                if token is None:
+                    return jsonify({"error": f"Token refresh succeeded, but no token exists for region {server_name}."}), 500
             before = make_request(encrypted_uid, server_name, token)
             if before is None:
                 return jsonify({"error": "Failed to retrieve player info. There are no valid token found! please update tokens.json with valid tokens"}), 500
@@ -450,7 +474,9 @@ def handle_requests():
                 return jsonify({"error": "Token expired and auto-refresh failed after likes. Check uidpass.json."}), 500
             token = select_token_for_region(tokens, server_name)
             if token is None:
-                return jsonify({"error": f"Token refresh succeeded, but no token exists for region {server_name}."}), 500
+                token = first_token_value(tokens)
+                if token is None:
+                    return jsonify({"error": f"Token refresh succeeded, but no token exists for region {server_name}."}), 500
             after = make_request(encrypted_uid, server_name, token)
             if after is None:
                 return jsonify({"error": "Failed to retrieve player info after likes."}), 500

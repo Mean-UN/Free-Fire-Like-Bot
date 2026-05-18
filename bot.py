@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 import telebot
@@ -40,6 +41,8 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "90"))
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
+BIO_API_KEY = os.getenv("BIO_API_KEY", os.getenv("API_KEY", "")).strip()
+BIO_API_BASE_URL = os.getenv("BIO_API_BASE_URL", "https://bio.ffutils.tech/api/update_bio").strip()
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN not found. Set BOT_TOKEN in environment variables.")
@@ -98,6 +101,43 @@ def build_join_markup():
         group_name = item.get("name", item["username"])
         markup.add(InlineKeyboardButton(f"Join {group_name}", url=f"https://t.me/{username}"))
     return markup
+
+
+def extract_access_token(raw):
+    raw = str(raw or "").strip()
+    if raw.startswith(("http://", "https://")):
+        try:
+            params = parse_qs(urlparse(raw).query)
+            if "eat" in params and params["eat"]:
+                return params["eat"][0]
+            if "access_token" in params and params["access_token"]:
+                return params["access_token"][0]
+        except Exception:
+            return None
+        return None
+
+    if raw and all(char in "abcdefghijklmnopqrstuvwxyz0123456789" for char in raw):
+        return raw
+    return None
+
+
+def call_bio_api(access_token, bio_text):
+    try:
+        url = f"{BIO_API_BASE_URL}?access_token={access_token}&bio={quote(bio_text, safe='')}"
+        if BIO_API_KEY:
+            url += f"&key={quote(BIO_API_KEY, safe='')}"
+        response = requests.get(url, timeout=20)
+        try:
+            return response.json()
+        except ValueError:
+            return {"status": "error", "message": "Invalid response from bio service."}
+    except requests.exceptions.Timeout:
+        return {"status": "error", "message": "Bio service timed out. Please try again."}
+    except requests.exceptions.ConnectionError:
+        return {"status": "error", "message": "Could not connect to bio service."}
+    except Exception as e:
+        logger.error(f"Bio API failed: {e}", exc_info=True)
+        return {"status": "error", "message": "Bio service failed. Please try again later."}
 
 
 def call_api(region, uid):
@@ -587,6 +627,31 @@ def add_uidpass_entry(uid, password):
     return updated, len(records)
 
 
+def notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_invalid):
+    if not removed_duplicates and not removed_failed and not removed_invalid:
+        return
+
+    def compact(items, limit=12):
+        values = [str(item) for item in items if item]
+        if len(values) > limit:
+            return ", ".join(values[:limit]) + f", +{len(values) - limit} more"
+        return ", ".join(values) if values else "None"
+
+    text = (
+        "🧹 UID/PASS cleanup completed\n\n"
+        f"🗑 Duplicate removed: {len(removed_duplicates)}\n"
+        f"⚠️ Failed removed: {len(removed_failed)}\n"
+        f"🚫 Invalid removed: {len(removed_invalid)}\n\n"
+        f"Duplicate UID: {compact(removed_duplicates)}\n"
+        f"Failed UID: {compact(removed_failed)}\n"
+        f"Invalid UID: {compact(removed_invalid)}"
+    )
+    try:
+        bot.send_message(OWNER_ID, text)
+    except Exception as e:
+        logger.error(f"Failed to notify owner about UID/PASS cleanup: {e}")
+
+
 def refresh_tokens_from_uidpass():
     try:
         from update_tokens import fetch_token
@@ -594,25 +659,50 @@ def refresh_tokens_from_uidpass():
         return False, 0, 0, [f"import error: {e}"]
 
     uidpass_list = load_json_file(UIDPASS_FILE, [])
+    original_total = len(uidpass_list)
+    seen_uids = set()
+    unique_records = []
     new_tokens = []
     failed_uids = []
+    removed_duplicates = []
+    removed_invalid = []
 
     for item in uidpass_list:
         uid = str(item.get("uid", "")).strip()
         password = str(item.get("password", "")).strip()
         if not uid or not password:
+            removed_invalid.append(uid or "missing_uid")
             continue
+        if uid in seen_uids:
+            removed_duplicates.append(uid)
+            continue
+        seen_uids.add(uid)
+        unique_records.append({"uid": uid, "password": password})
+
+    valid_records = []
+    for item in unique_records:
+        uid = item["uid"]
+        password = item["password"]
         token = fetch_token(uid, password)
         if token:
             new_tokens.append({"token": token})
+            valid_records.append(item)
         else:
             failed_uids.append(uid)
 
     if new_tokens:
         save_json_file(TOKEN_FILE, new_tokens)
-        return True, len(new_tokens), len(uidpass_list), failed_uids
+        removed_failed = failed_uids
+        if removed_duplicates or removed_invalid or removed_failed:
+            save_json_file(UIDPASS_FILE, valid_records)
+            notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_invalid)
+        return True, len(new_tokens), original_total, failed_uids
 
-    return False, 0, len(uidpass_list), failed_uids
+    if removed_duplicates or removed_invalid:
+        save_json_file(UIDPASS_FILE, unique_records)
+        notify_owner_token_cleanup(removed_duplicates, [], removed_invalid)
+
+    return False, 0, original_total, failed_uids
 
 
 def is_token_error(error_message):
@@ -902,6 +992,69 @@ def process_like(message, region, uid):
             bot.reply_to(message, error_msg)
 
 
+@bot.message_handler(commands=["bio"])
+def handle_bio(message):
+    user_id = message.from_user.id
+
+    if not is_user_in_channel(user_id):
+        bot.reply_to(message, "You must join all our channels to use this command.", reply_markup=build_join_markup())
+        return
+
+    parts = message.text.strip().split(None, 2)
+    if len(parts) < 3:
+        bot.reply_to(
+            message,
+            "Format: /bio <access_token_or_link> <new bio>\n\n"
+            "Accepted token formats:\n"
+            "- Plain lowercase token\n"
+            "- Kiosgamer link with ?eat=\n"
+            "- Garena Help link with ?access_token=",
+        )
+        return
+
+    token = extract_access_token(parts[1])
+    bio_text = parts[2].strip()
+
+    if token is None:
+        bot.reply_to(
+            message,
+            "Invalid access token format.\n\n"
+            "Send a plain lowercase token, a Kiosgamer link, or a Garena Help access_token link.",
+        )
+        return
+
+    if not bio_text:
+        bot.reply_to(message, "Bio text cannot be empty.")
+        return
+
+    processing_msg = bot.reply_to(message, "Please wait... Updating bio.")
+    result = call_bio_api(token, bio_text)
+
+    if str(result.get("status", "")).lower() == "success":
+        nickname = result.get("nickname", "Unknown")
+        uid = result.get("uid", "N/A")
+        platform = result.get("platform", "N/A")
+        region = result.get("region", "N/A")
+        new_bio = result.get("bio", bio_text)
+        text = (
+            "✅ Bio updated successfully\n\n"
+            f"👤 Player: {nickname}\n"
+            f"🆔 UID: {uid}\n"
+            f"📱 Platform: {platform}\n"
+            f"🌐 Region: {region}\n\n"
+            f"📝 New Bio: {new_bio}\n\n"
+            f"Support: {OWNER_USERNAME}"
+        )
+    else:
+        error_msg = result.get("message", "Unknown error occurred.")
+        text = f"❌ Failed to update bio\n\nReason: {error_msg}"
+
+    try:
+        bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
+    except Exception:
+        bot.reply_to(message, text)
+
+
 @bot.message_handler(commands=["remain", "uidpass", "adduidpass", "addremain"])
 def owner_commands(message):
     if message.from_user.id != OWNER_ID:
@@ -992,6 +1145,7 @@ def help_command(message):
             "/like <region> <uid> - Send likes to Free Fire UID\n"
             "/ffinfo <uid> - Show Free Fire player info\n"
             "/ffinfo <region> <uid> - Show player info for a region\n"
+            "/bio <token/link> <text> - Update Free Fire bio\n"
             "/start - Start or verify\n"
             "/help - Show this help menu\n\n"
             "Owner Commands:\n"
@@ -1009,6 +1163,7 @@ def help_command(message):
         "/like <region> <uid> - Send likes to Free Fire UID\n"
         "/ffinfo <uid> - Show Free Fire player info\n"
         "/ffinfo <region> <uid> - Show player info for a region\n"
+        "/bio <token/link> <text> - Update Free Fire bio\n"
         "/start - Start or verify\n"
         "/help - Show this help menu\n\n"
         f"Support: {OWNER_USERNAME}\n"
@@ -1025,7 +1180,7 @@ def reply_all(message):
     if not message.text.startswith("/"):
         return
 
-    known_commands = {"/start", "/like", "/ffinfo", "/help", "/remain", "/uidpass", "/adduidpass", "/addremain"}
+    known_commands = {"/start", "/like", "/ffinfo", "/bio", "/help", "/remain", "/uidpass", "/adduidpass", "/addremain"}
     command = message.text.split()[0].split("@")[0].lower()
     if command not in known_commands:
         bot.reply_to(message, "Unknown command. Use /help to see available commands.")

@@ -31,6 +31,10 @@ jobs:
           pip install requests
 
       - name: Run token update script
+        env:
+          UIDPASS_JSON: ${{ secrets.UIDPASS_JSON }}
+          FREEFIRE_UID: ${{ secrets.FREEFIRE_UID }}
+          FREEFIRE_PASSWORD: ${{ secrets.FREEFIRE_PASSWORD }}
         run: python update_tokens.py
 
       - name: Commit and push if changed
