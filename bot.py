@@ -63,6 +63,7 @@ OWNER_USERNAME = "@mean_un"
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
 GUESTGEN_REGIONS = {"IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "BR", "BD"}
+GUESTGEN_USAGE = "ℹ️ Usage: /guestgen <region> <name>\nExample: /guestgen SG ᴍᴇᴀɴXᴜɴ!"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -346,7 +347,24 @@ def br_heroic_stars(points):
     points = to_int(points)
     if points is None or points < 3200:
         return None
-    return max(1, min(5, (points - 3000) // 500))
+    return max(1, min(5, ((points - 3200) // 500) + 1))
+
+
+def br_master_stars(points):
+    points = to_int(points)
+    if points is None:
+        return None
+    thresholds = (
+        (10000, 5),
+        (9000, 4),
+        (8000, 3),
+        (7100, 2),
+        (6300, 1),
+    )
+    for minimum_points, stars in thresholds:
+        if points >= minimum_points:
+            return stars
+    return None
 
 
 def cs_visible_stars(rank, points):
@@ -366,12 +384,18 @@ def rank_name(value, points=None, mode="br"):
         return str(value or "N/A")
 
     if rank >= 326:
-        if mode == "br" and rank_points is not None and rank_points >= 8000:
-            return "Elite Master"
+        if mode == "br":
+            stars = br_master_stars(rank_points)
+            if rank_points is not None and rank_points >= 8000:
+                return f"Elite Master{star_label(stars)}"
+            if rank_points is not None and rank_points >= 6300:
+                return f"Master{star_label(stars)}"
         return "Master"
     if rank >= 321:
         if mode == "br":
-            stars = min(max(rank - 320, 1), 5)
+            stars = br_heroic_stars(rank_points)
+            if stars is None:
+                stars = min(max(rank - 320, 1), 5)
             return f"Heroic{star_label(min(stars, 5))}"
         cs_stars = cs_visible_stars(rank, rank_points)
         if rank >= 323:
@@ -437,7 +461,6 @@ def build_ffinfo_text(payload, requester):
     last_login = pick(basic, "lastLoginAt", "lastLogin", "AccountLastLogin")
     br_rank = pick(basic, "rank", "BrRank", "maxRank", "BrMaxRank")
     br_points = pick(basic, "rankingPoints", "BrRankPoint")
-    br_stars = min(max((to_int(br_rank) or 0) - 320, 0), 5) if to_int(br_rank) and to_int(br_rank) >= 321 else None
     cs_rank = pick(basic, "csRank", "CsRank", "csMaxRank", "CsMaxRank")
     cs_points = pick(basic, "csRankingPoints", "CsRankPoint", "csRankPoint")
     cs_stars = cs_visible_stars(cs_rank, cs_points)
@@ -485,14 +508,13 @@ def build_ffinfo_text(payload, requester):
             "🏆 BATTLE ROYALE\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🥇 Rank: {rank_name(br_rank, br_points, mode='br')}\n"
-            f"⭐ Stars: {format_number(br_stars)}\n"
             f"📊 Points: {format_number(br_points)}"
         ),
         (
             "⚔️ CLASH SQUAD\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🥈 Rank: {rank_name(cs_rank, cs_points, mode='cs')}\n"
-            f"⭐ Stars: {format_number(cs_stars)} (Total: {format_number(cs_points)})"
+            f"⭐️Total Stars: {format_number(cs_points)}"
         ),
     ]
 
@@ -529,8 +551,9 @@ def build_ffinfo_text(payload, requester):
             f"📈 Level: {format_number(captain_level)}\n"
             f"💙 Likes: {format_number(captain_likes)}\n"
             f"🏆 BR Rank: {rank_name(captain_br_rank, captain_br_points, mode='br')}\n"
+            f"📊 Points: {format_number(captain_br_points)}\n"
             f"⚔️ CS Rank: {rank_name(captain_cs_rank, captain_cs_points, mode='cs')}\n"
-            f"⭐ CS Stars: {format_number(captain_cs_stars)} (Total: {format_number(captain_cs_points)})\n"
+            f"⭐️Total Stars: {format_number(captain_cs_points)}\n"
             f"⏱ Last Login: {format_unix_date(captain_last_login)}"
         )
 
@@ -787,7 +810,16 @@ def notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_inval
         return
 
     def compact(items, limit=12):
-        values = [str(item) for item in items if item]
+        values = []
+        for item in items:
+            if not item:
+                continue
+            if isinstance(item, dict):
+                uid = str(item.get("uid", "")).strip()
+                password = str(item.get("password", "")).strip()
+                values.append(f"{uid}:{password}" if password else uid)
+            else:
+                values.append(str(item))
         if len(values) > limit:
             return ", ".join(values[:limit]) + f", +{len(values) - limit} more"
         return ", ".join(values) if values else "None"
@@ -798,7 +830,7 @@ def notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_inval
         f"⚠️ Failed removed: {len(removed_failed)}\n"
         f"🚫 Invalid removed: {len(removed_invalid)}\n\n"
         f"Duplicate UID: {compact(removed_duplicates)}\n"
-        f"Failed UID: {compact(removed_failed)}\n"
+        f"Failed UID/PASS: {compact(removed_failed)}\n"
         f"Invalid UID: {compact(removed_invalid)}"
     )
     try:
@@ -843,7 +875,7 @@ def refresh_tokens_from_uidpass():
             new_tokens.append({"token": token})
             valid_records.append(item)
         else:
-            failed_uids.append(uid)
+            failed_uids.append({"uid": uid, "password": password})
 
     if new_tokens:
         save_json_file(TOKEN_FILE, new_tokens)
@@ -1217,12 +1249,16 @@ def handle_guestgen(message):
         return
 
     args = message.text.split()
-    region = args[1].strip().upper() if len(args) >= 2 else "IND"
-    if region not in GUESTGEN_REGIONS:
-        bot.reply_to(message, f"Use: /guestgen [region] [name]\nExample: /guestgen SG Mean\n\nInvalid region. Use one of: {', '.join(sorted(GUESTGEN_REGIONS))}")
+    if len(args) < 3:
+        bot.reply_to(message, GUESTGEN_USAGE)
         return
 
-    base_name = " ".join(args[2:]).strip() if len(args) > 2 else ""
+    region = args[1].strip().upper()
+    if region not in GUESTGEN_REGIONS:
+        bot.reply_to(message, f"{GUESTGEN_USAGE}\n\nInvalid region. Use one of: {', '.join(sorted(GUESTGEN_REGIONS))}")
+        return
+
+    base_name = " ".join(args[2:]).strip()
     threading.Thread(target=process_guestgen, args=(message, region, base_name), daemon=True).start()
 
 
