@@ -619,7 +619,18 @@ def save_json_file(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
-def register_guest_account(region):
+def build_guest_name(base_name=""):
+    base_name = "".join(char for char in str(base_name or "").strip() if char.isprintable())
+    superscript_digits = "⁰¹²³⁴⁵⁶⁷⁸⁹"
+    if not base_name:
+        name_digits = "".join(superscript_digits[int(digit)] for digit in str(random.randint(1, 9999)))
+        return f"0xMe{name_digits}"
+
+    suffix = "".join(superscript_digits[int(digit)] for digit in str(random.randint(10, 99)))
+    return f"{base_name[: max(1, 12 - len(suffix))]}{suffix}"
+
+
+def register_guest_account(region, base_name=""):
     secret = b"2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
     client_id = "100067"
     user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
@@ -675,12 +686,12 @@ def register_guest_account(region):
             timeout=15,
         )
         if response.status_code != 200:
-            return None, None, f"Guest register failed: HTTP {response.status_code} - {response.text[:120]}"
+            return None, None, None, f"Guest register failed: HTTP {response.status_code} - {response.text[:120]}"
 
         register_data = response.json()
         uid = (register_data.get("data") or {}).get("uid") or register_data.get("uid")
         if not uid:
-            return None, None, "Guest register did not return UID."
+            return None, None, None, "Guest register did not return UID."
 
         token_body = {
             "uid": str(uid),
@@ -697,17 +708,17 @@ def register_guest_account(region):
             timeout=15,
         )
         if response.status_code != 200:
-            return None, None, f"Token grant failed: HTTP {response.status_code} - {response.text[:120]}"
+            return None, None, None, f"Token grant failed: HTTP {response.status_code} - {response.text[:120]}"
 
         token_data = response.json()
         access_token = token_data.get("access_token")
         open_id = token_data.get("open_id") or token_data.get("openId") or token_data.get("openid")
         if not access_token or not open_id:
-            return None, None, "Token grant did not return access token/open_id."
+            return None, None, None, "Token grant did not return access token/open_id."
 
-        name_digits = "".join("⁰¹²³⁴⁵⁶⁷⁸⁹"[int(digit)] for digit in str(random.randint(1, 9999)))
+        guest_name = build_guest_name(base_name)
         payload = {
-            1: f"0xMe{name_digits}",
+            1: guest_name,
             2: access_token,
             3: open_id,
             5: 102000007,
@@ -744,15 +755,15 @@ def register_guest_account(region):
             time.sleep(2 * (attempt + 1))
 
         if response.status_code == 200:
-            return str(uid), password_hash, None
-        return str(uid), password_hash, f"Major register failed: HTTP {response.status_code} - {response.text[:120]}"
+            return str(uid), password_hash, guest_name, None
+        return str(uid), password_hash, guest_name, f"Major register failed: HTTP {response.status_code} - {response.text[:120]}"
     except requests.exceptions.Timeout:
-        return None, None, "Guest generation timed out."
+        return None, None, None, "Guest generation timed out."
     except requests.exceptions.RequestException as e:
-        return None, None, f"Guest generation request failed: {e}"
+        return None, None, None, f"Guest generation request failed: {e}"
     except Exception as e:
         logger.error(f"Guest generation failed: {e}", exc_info=True)
-        return None, None, "Guest generation failed. Check bot logs."
+        return None, None, None, "Guest generation failed. Check bot logs."
     finally:
         session.close()
 
@@ -1206,26 +1217,24 @@ def handle_guestgen(message):
         return
 
     args = message.text.split()
-    if len(args) > 2:
-        bot.reply_to(message, "Use: /guestgen [region]\nExample: /guestgen IND")
-        return
-
-    region = args[1].strip().upper() if len(args) == 2 else "IND"
+    region = args[1].strip().upper() if len(args) >= 2 else "IND"
     if region not in GUESTGEN_REGIONS:
-        bot.reply_to(message, f"Invalid region. Use one of: {', '.join(sorted(GUESTGEN_REGIONS))}")
+        bot.reply_to(message, f"Use: /guestgen [region] [name]\nExample: /guestgen SG Mean\n\nInvalid region. Use one of: {', '.join(sorted(GUESTGEN_REGIONS))}")
         return
 
-    threading.Thread(target=process_guestgen, args=(message, region), daemon=True).start()
+    base_name = " ".join(args[2:]).strip() if len(args) > 2 else ""
+    threading.Thread(target=process_guestgen, args=(message, region, base_name), daemon=True).start()
 
 
-def process_guestgen(message, region):
+def process_guestgen(message, region, base_name=""):
     processing_msg = bot.reply_to(message, f"Please wait... Generating guest account for {region}.")
-    uid, password, error = register_guest_account(region)
+    uid, password, guest_name, error = register_guest_account(region, base_name)
 
     if uid and password and error:
         text = (
             "Guest account generated\n\n"
             f"Region: {region}\n"
+            f"Name: {guest_name}\n"
             f"UID: {uid}\n"
             f"Password: {password}\n\n"
             f"Warning: {error}"
@@ -1236,6 +1245,7 @@ def process_guestgen(message, region):
         text = (
             "Guest account generated\n\n"
             f"Region: {region}\n"
+            f"Name: {guest_name}\n"
             f"UID: {uid}\n"
             f"Password: {password}"
         )
@@ -1343,7 +1353,7 @@ def help_command(message):
             "/remain - Show all users usage\n"
             "/uidpass - Show total UID/PASS records\n"
             "/adduidpass <uid> <password> - Add/update UID/PASS and refresh tokens\n\n"
-            "/guestgen [region] - Generate guest UID/PASS\n\n"
+            "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
             f"Support: {OWNER_USERNAME}"
         )
         bot.reply_to(message, help_text)
