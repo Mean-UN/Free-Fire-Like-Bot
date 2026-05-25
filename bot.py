@@ -1,14 +1,19 @@
 ﻿import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
 from datetime import datetime, timedelta
 from urllib.parse import parse_qs, quote, urlparse
+import hashlib
+import hmac
 
 import requests
 import telebot
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
 from flask import Flask, jsonify, request
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -57,6 +62,7 @@ OWNER_ID = 1126297297
 OWNER_USERNAME = "@mean_un"
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
+GUESTGEN_REGIONS = {"IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "BR", "BD"}
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -613,6 +619,144 @@ def save_json_file(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
+def register_guest_account(region):
+    secret = b"2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+    client_id = "100067"
+    user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
+    session = requests.Session()
+
+    def encode_open_id(value):
+        key = [0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0]
+        return bytes(byte ^ key[index % len(key)] ^ 48 for index, byte in enumerate(value.encode()))
+
+    def aes_encrypt_hex(hex_value):
+        cipher = AES.new(b"Yg&tc%DEuh6%Zc^8", AES.MODE_CBC, b"6oyZDr22E3ychjM%")
+        return cipher.encrypt(pad(bytes.fromhex(hex_value), 16)).hex()
+
+    def encode_varint(number):
+        result = bytearray()
+        while number:
+            byte = number & 0x7F
+            number >>= 7
+            result.append(byte | (0x80 if number else 0))
+        return bytes(result)
+
+    def encode_field(field, value):
+        if isinstance(value, int):
+            return encode_varint((field << 3) | 0) + encode_varint(value)
+        data = value.encode() if isinstance(value, str) else value
+        return encode_varint((field << 3) | 2) + encode_varint(len(data)) + data
+
+    def encode_payload(payload):
+        packet = bytearray()
+        for field in sorted(payload):
+            packet.extend(encode_field(field, payload[field]))
+        return packet
+
+    try:
+        password = str(random.randint(1000000000, 9999999999))
+        password_hash = hashlib.sha256(password.encode()).hexdigest().upper()
+
+        body = json.dumps(
+            {"password": password_hash, "client_type": 2, "source": 2, "app_id": int(client_id)},
+            separators=(",", ":"),
+        )
+        headers = {
+            "Host": "100067.connect.garena.com",
+            "User-Agent": user_agent,
+            "Authorization": f"Signature {hmac.new(secret, body.encode(), hashlib.sha256).hexdigest()}",
+            "Content-Type": "application/json",
+        }
+
+        response = session.post(
+            "https://100067.connect.garena.com/api/v2/oauth/guest:register",
+            data=body,
+            headers=headers,
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return None, None, f"Guest register failed: HTTP {response.status_code} - {response.text[:120]}"
+
+        register_data = response.json()
+        uid = (register_data.get("data") or {}).get("uid") or register_data.get("uid")
+        if not uid:
+            return None, None, "Guest register did not return UID."
+
+        token_body = {
+            "uid": str(uid),
+            "password": password_hash,
+            "response_type": "token",
+            "client_type": "2",
+            "client_secret": secret.decode(),
+            "client_id": client_id,
+        }
+        response = session.post(
+            "https://100067.connect.garena.com/oauth/guest/token/grant",
+            data=token_body,
+            headers={"Host": "100067.connect.garena.com", "User-Agent": user_agent},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return None, None, f"Token grant failed: HTTP {response.status_code} - {response.text[:120]}"
+
+        token_data = response.json()
+        access_token = token_data.get("access_token")
+        open_id = token_data.get("open_id") or token_data.get("openId") or token_data.get("openid")
+        if not access_token or not open_id:
+            return None, None, "Token grant did not return access token/open_id."
+
+        name_digits = "".join("⁰¹²³⁴⁵⁶⁷⁸⁹"[int(digit)] for digit in str(random.randint(1, 9999)))
+        payload = {
+            1: f"0xMe{name_digits}",
+            2: access_token,
+            3: open_id,
+            5: 102000007,
+            6: 4,
+            7: 1,
+            13: 1,
+            14: encode_open_id(open_id),
+            15: region,
+            16: 1,
+        }
+        encrypted_data = bytes.fromhex(aes_encrypt_hex(encode_payload(payload).hex()))
+        major_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB53",
+            "Content-Type": "application/octet-stream",
+            "Content-Length": str(len(encrypted_data)),
+            "User-Agent": user_agent,
+            "Host": "loginbp.ggblueshark.com",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+        }
+        response = None
+        for attempt in range(3):
+            response = session.post(
+                "https://loginbp.ggblueshark.com/MajorRegister",
+                data=encrypted_data,
+                headers=major_headers,
+                timeout=15,
+            )
+            if response.status_code != 503:
+                break
+            time.sleep(2 * (attempt + 1))
+
+        if response.status_code == 200:
+            return str(uid), password_hash, None
+        return str(uid), password_hash, f"Major register failed: HTTP {response.status_code} - {response.text[:120]}"
+    except requests.exceptions.Timeout:
+        return None, None, "Guest generation timed out."
+    except requests.exceptions.RequestException as e:
+        return None, None, f"Guest generation request failed: {e}"
+    except Exception as e:
+        logger.error(f"Guest generation failed: {e}", exc_info=True)
+        return None, None, "Guest generation failed. Check bot logs."
+    finally:
+        session.close()
+
+
 def add_uidpass_entry(uid, password):
     records = load_json_file(UIDPASS_FILE, [])
     updated = False
@@ -1055,6 +1199,53 @@ def handle_bio(message):
         bot.reply_to(message, text)
 
 
+@bot.message_handler(commands=["guestgen"])
+def handle_guestgen(message):
+    if message.from_user.id != OWNER_ID:
+        bot.reply_to(message, "This command is owner only.")
+        return
+
+    args = message.text.split()
+    if len(args) > 2:
+        bot.reply_to(message, "Use: /guestgen [region]\nExample: /guestgen IND")
+        return
+
+    region = args[1].strip().upper() if len(args) == 2 else "IND"
+    if region not in GUESTGEN_REGIONS:
+        bot.reply_to(message, f"Invalid region. Use one of: {', '.join(sorted(GUESTGEN_REGIONS))}")
+        return
+
+    threading.Thread(target=process_guestgen, args=(message, region), daemon=True).start()
+
+
+def process_guestgen(message, region):
+    processing_msg = bot.reply_to(message, f"Please wait... Generating guest account for {region}.")
+    uid, password, error = register_guest_account(region)
+
+    if uid and password and error:
+        text = (
+            "Guest account generated\n\n"
+            f"Region: {region}\n"
+            f"UID: {uid}\n"
+            f"Password: {password}\n\n"
+            f"Warning: {error}"
+        )
+    elif error:
+        text = f"Guest generation failed\n\nRegion: {region}\nReason: {error}"
+    else:
+        text = (
+            "Guest account generated\n\n"
+            f"Region: {region}\n"
+            f"UID: {uid}\n"
+            f"Password: {password}"
+        )
+
+    try:
+        bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
+    except Exception:
+        bot.reply_to(message, text)
+
+
 @bot.message_handler(commands=["remain", "uidpass", "adduidpass", "addremain"])
 def owner_commands(message):
     if message.from_user.id != OWNER_ID:
@@ -1152,6 +1343,7 @@ def help_command(message):
             "/remain - Show all users usage\n"
             "/uidpass - Show total UID/PASS records\n"
             "/adduidpass <uid> <password> - Add/update UID/PASS and refresh tokens\n\n"
+            "/guestgen [region] - Generate guest UID/PASS\n\n"
             f"Support: {OWNER_USERNAME}"
         )
         bot.reply_to(message, help_text)
@@ -1180,7 +1372,18 @@ def reply_all(message):
     if not message.text.startswith("/"):
         return
 
-    known_commands = {"/start", "/like", "/ffinfo", "/bio", "/help", "/remain", "/uidpass", "/adduidpass", "/addremain"}
+    known_commands = {
+        "/start",
+        "/like",
+        "/ffinfo",
+        "/bio",
+        "/help",
+        "/remain",
+        "/uidpass",
+        "/adduidpass",
+        "/addremain",
+        "/guestgen",
+    }
     command = message.text.split()[0].split("@")[0].lower()
     if command not in known_commands:
         bot.reply_to(message, "Unknown command. Use /help to see available commands.")

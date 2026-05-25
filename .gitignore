@@ -15,6 +15,9 @@ env/
 .env.*
 tokens.json
 uidpass.json
+guest_accounts.json
+formatted_guests.json
+guests_converted.json
 
 # Logs and runtime files
 *.log
