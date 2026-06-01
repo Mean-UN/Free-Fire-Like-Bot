@@ -841,6 +841,16 @@ def add_uidpass_entry(uid, password):
     return True, len(records)
 
 
+def update_uidpass_entry(uid, password):
+    records = load_json_file(UIDPASS_FILE, [])
+    for item in records:
+        if str(item.get("uid", "")).strip() == uid:
+            item["password"] = password
+            save_json_file(UIDPASS_FILE, records)
+            return True, len(records)
+    return False, len(records)
+
+
 def upsert_token_entry(uid, token):
     tokens = load_json_file(TOKEN_FILE, [])
     if not isinstance(tokens, list):
@@ -1388,7 +1398,7 @@ def process_guestgen(message, region, base_name=""):
         bot.reply_to(message, text)
 
 
-@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "addremain"])
+@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "updateuidpass", "addremain"])
 def owner_commands(message):
     if message.from_user.id != OWNER_ID:
         return
@@ -1448,6 +1458,40 @@ def owner_commands(message):
         )
         return
 
+    if cmd == "/updateuidpass":
+        if len(args) != 3:
+            bot.reply_to(message, "Use: /updateuidpass <uid> <new_password>")
+            return
+
+        uid = args[1].strip()
+        password = args[2].strip()
+
+        if not uid.isdigit():
+            bot.reply_to(message, "UID must be numeric.")
+            return
+
+        records = load_json_file(UIDPASS_FILE, [])
+        if not any(str(item.get("uid", "")).strip() == uid for item in records):
+            bot.reply_to(message, f"NOT FOUND: UID {uid} does not exist in uidpass.json.")
+            return
+
+        token, error = fetch_single_token(uid, password)
+        if not token:
+            bot.reply_to(message, f"WARN: UID {uid} not updated. Error: {error}")
+            return
+
+        updated, total = update_uidpass_entry(uid, password)
+        if not updated:
+            bot.reply_to(message, f"NOT FOUND: UID {uid} does not exist in uidpass.json.")
+            return
+
+        count = upsert_token_entry(uid, token)
+        bot.reply_to(
+            message,
+            f"OK: UID {uid} password updated. UID/PASS total: {total} | Tokens now: {count}",
+        )
+        return
+
     if cmd == "/addremain":
         if len(args) != 3:
             bot.reply_to(message, "Use: /addremain <userid> <n>\nExample: /addremain 123456789 5")
@@ -1490,6 +1534,7 @@ def help_command(message):
             "/remain - Show all users usage\n"
             "/uidpass - Show total UID/PASS records\n"
             "/adduidpass <uid> <password> - Add UID/PASS and fetch only its token\n\n"
+            "/updateuidpass <uid> <new_password> - Update password after token check\n"
             "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
             f"Support: {OWNER_USERNAME}"
         )
@@ -1528,6 +1573,7 @@ def reply_all(message):
         "/remain",
         "/uidpass",
         "/adduidpass",
+        "/updateuidpass",
         "/addremain",
         "/guestgen",
     }
