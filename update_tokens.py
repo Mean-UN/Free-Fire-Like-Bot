@@ -57,9 +57,10 @@ def main():
     uidpass_list = read_uidpass()
     new_tokens = []
     for item in uidpass_list:
-        token = fetch_token(item["uid"], item["password"])
+        uid = str(item["uid"])
+        token = fetch_token(uid, item["password"])
         if token:
-            new_tokens.append({"token": token})
+            new_tokens.append({"uid": uid, "token": token})
     if new_tokens:
         update_token_file(new_tokens)
         print(f"tokens.json updated successfully. valid={len(new_tokens)} total={len(uidpass_list)}")

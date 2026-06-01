@@ -243,6 +243,45 @@ def call_ffinfo_api(region, uid):
         return {"error": "Invalid JSON response from API."}
 
 
+def extract_ffinfo_region(response):
+    if not isinstance(response, dict):
+        return ""
+
+    region = str(response.get("Region") or "").strip().upper()
+    if region:
+        return region
+
+    data = response.get("data", response)
+    if isinstance(data, dict) and "result" in data and isinstance(data["result"], dict):
+        data = data["result"]
+    if not isinstance(data, dict):
+        return ""
+
+    basic = pick(data, "basicInfo", "AccountInfo", default={})
+    if isinstance(basic, dict):
+        return str(pick(basic, "region", "AccountRegion", default="")).strip().upper()
+    return ""
+
+
+def resolve_uid_region(uid):
+    response = call_ffinfo_api("", uid)
+    if "error" in response and is_token_error(response.get("error", "")):
+        ok, count, total, failed_uids = refresh_tokens_from_uidpass()
+        if ok:
+            logger.info(
+                f"Auto-refreshed tokens before region lookup. total={total} valid={count} failed={len(failed_uids)}"
+            )
+            response = call_ffinfo_api("", uid)
+
+    if "error" in response:
+        return "", response.get("error", "Could not resolve UID region.")
+
+    resolved_region = extract_ffinfo_region(response)
+    if not resolved_region:
+        return "", "Could not detect UID region."
+    return resolved_region, ""
+
+
 def format_ffinfo_error(response, region, uid):
     status_code = response.get("status_code")
     details = response.get("details") or {}
@@ -793,16 +832,46 @@ def register_guest_account(region, base_name=""):
 
 def add_uidpass_entry(uid, password):
     records = load_json_file(UIDPASS_FILE, [])
-    updated = False
     for item in records:
         if str(item.get("uid", "")).strip() == uid:
-            item["password"] = password
+            return False, len(records)
+
+    records.append({"uid": uid, "password": password})
+    save_json_file(UIDPASS_FILE, records)
+    return True, len(records)
+
+
+def upsert_token_entry(uid, token):
+    tokens = load_json_file(TOKEN_FILE, [])
+    if not isinstance(tokens, list):
+        tokens = []
+
+    updated = False
+    for item in tokens:
+        if isinstance(item, dict) and str(item.get("uid", "")).strip() == uid:
+            item["token"] = token
             updated = True
             break
+
     if not updated:
-        records.append({"uid": uid, "password": password})
-    save_json_file(UIDPASS_FILE, records)
-    return updated, len(records)
+        tokens.append({"uid": uid, "token": token})
+
+    save_json_file(TOKEN_FILE, tokens)
+    return len(tokens)
+
+
+def refresh_single_uidpass(uid, password):
+    try:
+        from update_tokens import fetch_token
+    except Exception as e:
+        return False, 0, f"import error: {e}"
+
+    token = fetch_token(uid, password)
+    if not token:
+        return False, len(load_json_file(TOKEN_FILE, [])), "token fetch failed"
+
+    total_tokens = upsert_token_entry(uid, token)
+    return True, total_tokens, ""
 
 
 def notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_invalid):
@@ -825,10 +894,10 @@ def notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_inval
         return ", ".join(values) if values else "None"
 
     text = (
-        "🧹 UID/PASS cleanup completed\n\n"
-        f"🗑 Duplicate removed: {len(removed_duplicates)}\n"
-        f"⚠️ Failed removed: {len(removed_failed)}\n"
-        f"🚫 Invalid removed: {len(removed_invalid)}\n\n"
+        "UID/PASS token refresh report\n\n"
+        f"Duplicate skipped: {len(removed_duplicates)}\n"
+        f"Failed token: {len(removed_failed)}\n"
+        f"Invalid skipped: {len(removed_invalid)}\n\n"
         f"Duplicate UID: {compact(removed_duplicates)}\n"
         f"Failed UID/PASS: {compact(removed_failed)}\n"
         f"Invalid UID: {compact(removed_invalid)}"
@@ -848,7 +917,6 @@ def refresh_tokens_from_uidpass():
     uidpass_list = load_json_file(UIDPASS_FILE, [])
     original_total = len(uidpass_list)
     seen_uids = set()
-    unique_records = []
     new_tokens = []
     failed_uids = []
     removed_duplicates = []
@@ -864,29 +932,19 @@ def refresh_tokens_from_uidpass():
             removed_duplicates.append(uid)
             continue
         seen_uids.add(uid)
-        unique_records.append({"uid": uid, "password": password})
-
-    valid_records = []
-    for item in unique_records:
-        uid = item["uid"]
-        password = item["password"]
         token = fetch_token(uid, password)
         if token:
-            new_tokens.append({"token": token})
-            valid_records.append(item)
+            new_tokens.append({"uid": uid, "token": token})
         else:
             failed_uids.append({"uid": uid, "password": password})
 
     if new_tokens:
         save_json_file(TOKEN_FILE, new_tokens)
-        removed_failed = failed_uids
-        if removed_duplicates or removed_invalid or removed_failed:
-            save_json_file(UIDPASS_FILE, valid_records)
-            notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_invalid)
+        if removed_duplicates or removed_invalid or failed_uids:
+            notify_owner_token_cleanup(removed_duplicates, failed_uids, removed_invalid)
         return True, len(new_tokens), original_total, failed_uids
 
     if removed_duplicates or removed_invalid:
-        save_json_file(UIDPASS_FILE, unique_records)
         notify_owner_token_cleanup(removed_duplicates, [], removed_invalid)
 
     return False, 0, original_total, failed_uids
@@ -1092,7 +1150,26 @@ def process_like(message, region, uid):
         bot.reply_to(message, "You have exceeded your daily request limit.")
         return
 
-    processing_msg = bot.reply_to(message, "Please wait... Sending likes.")
+    processing_msg = bot.reply_to(message, "Please wait... Checking UID region.")
+    requested_region = region
+    resolved_region, region_error = resolve_uid_region(uid)
+    region_note = ""
+    if resolved_region:
+        region = resolved_region
+        if resolved_region != requested_region:
+            region_note = f"\n🔁 Requested Region: {requested_region} | Detected Region: {resolved_region}"
+    elif region_error:
+        logger.info(f"Could not auto-detect region for UID {uid}: {region_error}")
+
+    try:
+        bot.edit_message_text(
+            text=f"Please wait... Sending likes to {region}.",
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+        )
+    except Exception:
+        pass
+
     response = call_api(region, uid)
     auto_refreshed = False
 
@@ -1105,6 +1182,17 @@ def process_like(message, region, uid):
                     f"Auto-refreshed tokens from uidpass.json. total={total} valid={count} failed={len(failed_uids)}"
                 )
                 response = call_api(region, uid)
+
+        if "error" in response and not resolved_region:
+            fallback_region, fallback_error = resolve_uid_region(uid)
+            if fallback_region and fallback_region != region:
+                logger.info(f"Retrying like for UID {uid} with detected region {fallback_region} after {region} failed.")
+                requested_region = region
+                region = fallback_region
+                region_note = f"\n🔁 Requested Region: {requested_region} | Detected Region: {fallback_region}"
+                response = call_api(region, uid)
+            elif fallback_error:
+                logger.info(f"Like fallback region lookup failed for UID {uid}: {fallback_error}")
 
         if "error" in response and auto_refreshed:
             response["error"] = f"{response['error']} (tokens auto-refreshed and retried once)"
@@ -1158,6 +1246,7 @@ def process_like(message, region, uid):
             f"➕ Likes Added: {likes_given}\n"
             f"⭐ Total Likes Now: {likes_after}\n"
             f"📊 Remaining Requests: {max_limit - usage['used']}\n"
+            f"{region_note}\n"
             "\n🔗 Credit: @Mean_Un"
         )
 
@@ -1330,13 +1419,17 @@ def owner_commands(message):
             bot.reply_to(message, "UID must be numeric.")
             return
 
-        updated, total = add_uidpass_entry(uid, password)
-        ok, count, _, failed_uids = refresh_tokens_from_uidpass()
-        action = "updated" if updated else "added"
+        added, total = add_uidpass_entry(uid, password)
+        if not added:
+            bot.reply_to(message, f"DUPLICATE: UID {uid} already exists. No changes made. UID/PASS total: {total}")
+            return
+
+        ok, count, error = refresh_single_uidpass(uid, password)
         status = "OK" if ok else "WARN"
+        detail = f" | Error: {error}" if error else ""
         bot.reply_to(
             message,
-            f"{status}: UID {uid} {action}. UID/PASS total: {total} | Valid tokens now: {count} | Failed: {len(failed_uids)}",
+            f"{status}: UID {uid} added. UID/PASS total: {total} | Tokens now: {count}{detail}",
         )
         return
 
@@ -1363,13 +1456,6 @@ def owner_commands(message):
         like_tracker[user_id]["used"] = max(0, get_user_limit(user_id) - n)
         bot.reply_to(message, f"✅ User {user_id}: Remaining requests set to {n}")
         return
-        ok, count, _, failed_uids = refresh_tokens_from_uidpass()
-        action = "updated" if updated else "added"
-        status = "OK" if ok else "WARN"
-        bot.reply_to(
-            message,
-            f"{status}: UID {uid} {action}. UID/PASS total: {total} | Valid tokens now: {count} | Failed: {len(failed_uids)}",
-        )
 
 
 @bot.message_handler(commands=["help"])
@@ -1388,7 +1474,7 @@ def help_command(message):
             "Owner Commands:\n"
             "/remain - Show all users usage\n"
             "/uidpass - Show total UID/PASS records\n"
-            "/adduidpass <uid> <password> - Add/update UID/PASS and refresh tokens\n\n"
+            "/adduidpass <uid> <password> - Add UID/PASS and fetch only its token\n\n"
             "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
             f"Support: {OWNER_USERNAME}"
         )

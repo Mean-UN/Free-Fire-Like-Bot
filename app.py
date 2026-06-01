@@ -67,7 +67,7 @@ def refresh_tokens_from_uidpass():
             except Exception:
                 token = None
             if token and isinstance(token, str):
-                new_tokens.append({"token": token})
+                new_tokens.append({"uid": uid, "token": token})
             else:
                 failed_uids.append(uid)
 
