@@ -25,6 +25,8 @@ TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
 TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
+TOKEN_RETRY_ATTEMPTS = int(os.getenv("TOKEN_RETRY_ATTEMPTS", "10"))
+TOKEN_RETRY_DELAY_SECONDS = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "0.7"))
 FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info-ob49.onrender.com/api/account/").strip()
 FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
@@ -45,6 +47,29 @@ def read_uidpass_records():
     with open(UIDPASS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def fetch_token_with_retry(uid, password):
+    last_error = None
+    for attempt in range(1, TOKEN_RETRY_ATTEMPTS + 1):
+        try:
+            response = requests.get(
+                TOKEN_API_URL,
+                params={"uid": uid, "password": password},
+                timeout=20
+            )
+            response.raise_for_status()
+            token = response.json().get("token")
+            if token and isinstance(token, str):
+                return token
+            last_error = "token missing in response"
+        except Exception as e:
+            last_error = e
+
+        if attempt < TOKEN_RETRY_ATTEMPTS:
+            time.sleep(TOKEN_RETRY_DELAY_SECONDS)
+
+    app.logger.error(f"Token fetch failed for UID {uid} after {TOKEN_RETRY_ATTEMPTS} attempts: {last_error}")
+    return None
+
 def refresh_tokens_from_uidpass():
     try:
         uidpass_list = read_uidpass_records()
@@ -56,16 +81,7 @@ def refresh_tokens_from_uidpass():
             password = str(item.get("password", "")).strip()
             if not uid or not password:
                 continue
-            try:
-                response = requests.get(
-                    TOKEN_API_URL,
-                    params={"uid": uid, "password": password},
-                    timeout=20
-                )
-                response.raise_for_status()
-                token = response.json().get("token")
-            except Exception:
-                token = None
+            token = fetch_token_with_retry(uid, password)
             if token and isinstance(token, str):
                 new_tokens.append({"uid": uid, "token": token})
             else:

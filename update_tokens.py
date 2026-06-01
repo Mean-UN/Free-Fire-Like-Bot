@@ -2,10 +2,13 @@ import requests
 import json
 import os
 import sys
+import time
 
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
 API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
+TOKEN_RETRY_ATTEMPTS = 10
+TOKEN_RETRY_DELAY_SECONDS = 0.7
 
 def read_uidpass():
     uidpass_json = os.getenv("UIDPASS_JSON", "").strip()
@@ -40,14 +43,24 @@ def read_uidpass():
 
 def fetch_token(uid, password):
     url = f"{API_URL}?uid={uid}&password={password}"
-    try:
-        response = requests.get(url, timeout=20)
-        response.raise_for_status()
-        data = response.json()
-        return data.get("token")
-    except Exception as e:
-        print(f"Error fetching token for UID {uid}: {e}")
-        return None
+    last_error = None
+    for attempt in range(1, TOKEN_RETRY_ATTEMPTS + 1):
+        try:
+            response = requests.get(url, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            token = data.get("token")
+            if token:
+                return token
+            last_error = "token missing in response"
+        except Exception as e:
+            last_error = e
+
+        if attempt < TOKEN_RETRY_ATTEMPTS:
+            time.sleep(TOKEN_RETRY_DELAY_SECONDS)
+
+    print(f"Error fetching token for UID {uid} after {TOKEN_RETRY_ATTEMPTS} attempts: {last_error}")
+    return None
 
 def update_token_file(token_list):
     with open(TOKEN_FILE, "w", encoding="utf-8") as f:
