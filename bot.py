@@ -874,6 +874,18 @@ def refresh_single_uidpass(uid, password):
     return True, total_tokens, ""
 
 
+def fetch_single_token(uid, password):
+    try:
+        from update_tokens import fetch_token
+    except Exception as e:
+        return None, f"import error: {e}"
+
+    token = fetch_token(uid, password)
+    if not token:
+        return None, "token fetch failed"
+    return token, ""
+
+
 def notify_owner_token_cleanup(removed_duplicates, removed_failed, removed_invalid):
     if not removed_duplicates and not removed_failed and not removed_invalid:
         return
@@ -1153,11 +1165,8 @@ def process_like(message, region, uid):
     processing_msg = bot.reply_to(message, "Please wait... Checking UID region.")
     requested_region = region
     resolved_region, region_error = resolve_uid_region(uid)
-    region_note = ""
     if resolved_region:
         region = resolved_region
-        if resolved_region != requested_region:
-            region_note = f"\n🔁 Requested Region: {requested_region} | Detected Region: {resolved_region}"
     elif region_error:
         logger.info(f"Could not auto-detect region for UID {uid}: {region_error}")
 
@@ -1189,7 +1198,6 @@ def process_like(message, region, uid):
                 logger.info(f"Retrying like for UID {uid} with detected region {fallback_region} after {region} failed.")
                 requested_region = region
                 region = fallback_region
-                region_note = f"\n🔁 Requested Region: {requested_region} | Detected Region: {fallback_region}"
                 response = call_api(region, uid)
             elif fallback_error:
                 logger.info(f"Like fallback region lookup failed for UID {uid}: {fallback_error}")
@@ -1246,7 +1254,6 @@ def process_like(message, region, uid):
             f"➕ Likes Added: {likes_given}\n"
             f"⭐ Total Likes Now: {likes_after}\n"
             f"📊 Remaining Requests: {max_limit - usage['used']}\n"
-            f"{region_note}\n"
             "\n🔗 Credit: @Mean_Un"
         )
 
@@ -1419,17 +1426,25 @@ def owner_commands(message):
             bot.reply_to(message, "UID must be numeric.")
             return
 
+        records = load_json_file(UIDPASS_FILE, [])
+        if any(str(item.get("uid", "")).strip() == uid for item in records):
+            bot.reply_to(message, f"DUPLICATE: UID {uid} already exists. No changes made. UID/PASS total: {len(records)}")
+            return
+
+        token, error = fetch_single_token(uid, password)
+        if not token:
+            bot.reply_to(message, f"WARN: UID {uid} not added. Error: {error}")
+            return
+
         added, total = add_uidpass_entry(uid, password)
         if not added:
             bot.reply_to(message, f"DUPLICATE: UID {uid} already exists. No changes made. UID/PASS total: {total}")
             return
 
-        ok, count, error = refresh_single_uidpass(uid, password)
-        status = "OK" if ok else "WARN"
-        detail = f" | Error: {error}" if error else ""
+        count = upsert_token_entry(uid, token)
         bot.reply_to(
             message,
-            f"{status}: UID {uid} added. UID/PASS total: {total} | Tokens now: {count}{detail}",
+            f"OK: UID {uid} added. UID/PASS total: {total} | Tokens now: {count}",
         )
         return
 
