@@ -27,8 +27,8 @@ TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
 TOKEN_RETRY_ATTEMPTS = int(os.getenv("TOKEN_RETRY_ATTEMPTS", "10"))
 TOKEN_RETRY_DELAY_SECONDS = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "0.7"))
-FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info-ob49.onrender.com/api/account/").strip()
-FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
+FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://siambhau69.eu.cc/freefireinfo/bhau").strip()
+FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "Free2026").strip()
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 FFINFO_DEFAULT_REGIONS = [
@@ -205,16 +205,14 @@ def fetch_external_ffinfo(uid, server_name):
     regions = [server_name] if server_name else FFINFO_DEFAULT_REGIONS
     last_error = {"error": "No region returned data"}
     for region in regions:
-        headers = {}
         params = {"uid": uid, "region": ffinfo_api_region(region)}
         if FFINFO_API_KEY:
-            headers["x-api-key"] = FFINFO_API_KEY
+            params["key"] = FFINFO_API_KEY
 
         try:
             response = requests.get(
                 FFINFO_API_URL,
                 params=params,
-                headers=headers,
                 timeout=UPSTREAM_TIMEOUT_SECONDS,
             )
             if response.status_code != 200:

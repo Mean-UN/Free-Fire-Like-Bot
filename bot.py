@@ -48,6 +48,13 @@ AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 BIO_API_KEY = os.getenv("BIO_API_KEY", os.getenv("API_KEY", "")).strip()
 BIO_API_BASE_URL = os.getenv("BIO_API_BASE_URL", "https://bio.ffutils.tech/api/update_bio").strip()
+FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://siambhau69.eu.cc/freefireinfo/bhau").strip()
+FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "Free2026").strip()
+FFINFO_DEFAULT_REGIONS = [
+    item.strip().upper()
+    for item in os.getenv("FFINFO_DEFAULT_REGIONS", "SG,IND,BD,BR,US,SAC,NA,EU,ME,TH,VN,ID,TW,RU").split(",")
+    if item.strip()
+]
 
 if not BOT_TOKEN:
     logger.error("BOT_TOKEN not found. Set BOT_TOKEN in environment variables.")
@@ -242,6 +249,53 @@ def call_ffinfo_api(region, uid):
     except ValueError:
         return {"error": "Invalid JSON response from API."}
 
+
+def call_direct_ffinfo_api(region, uid):
+    if not FFINFO_API_URL:
+        return {"error": "Direct player info API is disabled."}
+
+    regions = [region.upper()] if region else FFINFO_DEFAULT_REGIONS
+    last_error = {"error": "Direct player information could not be fetched."}
+
+    for lookup_region in regions:
+        api_region = "eu" if lookup_region == "EUROPE" else lookup_region.lower()
+        try:
+            logger.info(f"Calling direct FF info API: url={FFINFO_API_URL} region={lookup_region} uid={uid}")
+            params = {"uid": uid, "region": api_region}
+            if FFINFO_API_KEY:
+                params["key"] = FFINFO_API_KEY
+            response = requests.get(
+                FFINFO_API_URL,
+                params=params,
+                timeout=API_TIMEOUT_SECONDS,
+            )
+            if response.status_code != 200:
+                last_error = {
+                    "error": "Direct player information could not be fetched.",
+                    "details": {
+                        "status_code": response.status_code,
+                        "body": response.text[:180],
+                    },
+                    "status_code": response.status_code,
+                }
+                continue
+            data = response.json()
+            return {
+                "source": "external-direct",
+                "Region": lookup_region,
+                "data": data,
+                "status": 1,
+            }
+        except requests.exceptions.Timeout:
+            logger.error(f"Direct FF info API timeout after {API_TIMEOUT_SECONDS}s for uid={uid} region={lookup_region}")
+            last_error = {"error": f"Direct API timed out after {API_TIMEOUT_SECONDS}s. Please try again."}
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Direct FF info API request failed: {e}")
+            last_error = {"error": "Direct player info API failed. Please try again later."}
+        except ValueError:
+            last_error = {"error": "Invalid JSON response from direct player info API."}
+
+    return last_error
 
 def extract_ffinfo_region(response):
     if not isinstance(response, dict):
@@ -495,6 +549,8 @@ def build_ffinfo_text(payload, requester):
     exp = pick(basic, "exp", "AccountEXP")
     likes = pick(basic, "liked", "likes", "AccountLikes", "Likes")
     badges = pick(basic, "badgeCnt", "badgeCount", "AccountBPBadges", "badges")
+    prime_info = pick(basic, "primeInfo", default={}) if isinstance(basic, dict) else {}
+    prime_level = pick(prime_info, "primeLevel", default=0) if isinstance(prime_info, dict) else 0
     title = pick(basic, "title", "Title", "AccountTitle", "TitleID")
     created = pick(basic, "createAt", "createdAt", "AccountCreateTime")
     last_login = pick(basic, "lastLoginAt", "lastLogin", "AccountLastLogin")
@@ -539,6 +595,7 @@ def build_ffinfo_text(payload, requester):
             f"✨ EXP: {format_number(exp)}\n"
             f"💙 Likes: {format_number(likes)}\n"
             f"🎖 Badges: {format_number(badges)}\n"
+            f"💎 Prime Level: {format_number(prime_level)}\n"
             f"🏅 Title ID: {format_number(title)}\n"
             f"📆 Created: {format_unix_date(created)}\n"
             f"⏱ Last Login: {format_unix_date(last_login)}"
@@ -1116,6 +1173,19 @@ def process_ffinfo(message, region, uid):
     auto_refreshed = False
 
     if "error" in response:
+        status_code = response.get("status_code")
+        error_message = str(response.get("error", ""))
+        can_try_direct = (
+            (status_code and status_code >= 500)
+            or error_message.startswith("Cannot connect to API")
+            or "timed out" in error_message.lower()
+            or error_message in {"API failed. Please try again later.", "Invalid JSON response from API."}
+        )
+        if can_try_direct:
+            direct_response = call_direct_ffinfo_api(region, uid)
+            if "error" not in direct_response:
+                response = direct_response
+
         if is_token_error(response.get("error", "")):
             ok, count, total, failed_uids = refresh_tokens_from_uidpass()
             auto_refreshed = ok
@@ -1128,13 +1198,14 @@ def process_ffinfo(message, region, uid):
         if "error" in response and auto_refreshed:
             response["error"] = f"{response['error']} (tokens auto-refreshed and retried once)"
 
-        text = format_ffinfo_error(response, region, uid)
-        logger.error(f"FF info API error for uid={uid} region={region or 'AUTO'}: {response['error']}")
-        try:
-            bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
-        except Exception:
-            bot.reply_to(message, text)
-        return
+        if "error" in response:
+            text = format_ffinfo_error(response, region, uid)
+            logger.error(f"FF info API error for uid={uid} region={region or 'AUTO'}: {response['error']}")
+            try:
+                bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
+            except Exception:
+                bot.reply_to(message, text)
+            return
 
     try:
         if response.get("source") == "local":
