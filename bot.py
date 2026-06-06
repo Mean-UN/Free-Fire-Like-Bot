@@ -1020,10 +1020,7 @@ def format_jwt_check_result(uid, data, attempts):
         "🔑 Access Token\n"
         f"{access_token}\n\n"
         "🎟 JWT Token\n"
-        f"{token}\n\n"
-        "Short Preview\n"
-        f"Access: {short_secret(access_token)}\n"
-        f"JWT: {short_secret(token)}"
+        f"{token}"
     )
 
 
