@@ -46,6 +46,9 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "90"))
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
+JWT_API_URL = os.getenv("JWT_API_URL", "https://xtytdtyj-jwt.up.railway.app/token").strip()
+JWT_RETRY_ATTEMPTS = int(os.getenv("JWT_RETRY_ATTEMPTS", "10"))
+JWT_RETRY_DELAY_SECONDS = float(os.getenv("JWT_RETRY_DELAY_SECONDS", "0.7"))
 BIO_API_KEY = os.getenv("BIO_API_KEY", os.getenv("API_KEY", "")).strip()
 BIO_API_BASE_URL = os.getenv("BIO_API_BASE_URL", "https://bio.ffutils.tech/api/update_bio").strip()
 FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info.killersharmabot.online/player-info").strip()
@@ -962,6 +965,68 @@ def upsert_token_entry(uid, token):
     return len(tokens)
 
 
+def check_jwt(uid, password, attempts=JWT_RETRY_ATTEMPTS, delay=JWT_RETRY_DELAY_SECONDS):
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                JWT_API_URL,
+                params={"uid": uid, "password": password},
+                timeout=20,
+            )
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code}: {response.text[:160]}"
+            else:
+                data = response.json()
+                token = data.get("token")
+                status = str(data.get("status", "")).strip().lower()
+                if token and (not status or status == "success"):
+                    return data, "", attempt
+                last_error = data.get("error") or data.get("message") or "token missing in response"
+        except ValueError:
+            last_error = "Invalid JSON response from JWT API."
+        except requests.exceptions.Timeout:
+            last_error = "JWT API timed out."
+        except requests.exceptions.RequestException as e:
+            last_error = f"JWT API request failed: {e}"
+
+        if attempt < attempts:
+            time.sleep(delay)
+
+    return None, last_error or "JWT check failed.", attempts
+
+
+def short_secret(value, head=18, tail=12):
+    text = str(value or "").strip()
+    if not text:
+        return "N/A"
+    if len(text) <= head + tail + 3:
+        return text
+    return f"{text[:head]}...{text[-tail:]}"
+
+
+def format_jwt_check_result(uid, data, attempts):
+    access_token = data.get("access_token", "N/A")
+    account_id = data.get("account_id", "N/A")
+    region = data.get("region", "N/A")
+    token = data.get("token", "N/A")
+
+    return (
+        "✅ JWT CHECK SUCCESS\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Account ID: {account_id}\n"
+        f"🌐 Region: {region}\n"
+        "\n"
+        "🔑 Access Token\n"
+        f"{access_token}\n\n"
+        "🎟 JWT Token\n"
+        f"{token}\n\n"
+        "Short Preview\n"
+        f"Access: {short_secret(access_token)}\n"
+        f"JWT: {short_secret(token)}"
+    )
+
+
 def refresh_single_uidpass(uid, password):
     try:
         from update_tokens import fetch_token
@@ -1504,7 +1569,32 @@ def process_guestgen(message, region, base_name=""):
         bot.reply_to(message, text)
 
 
-@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "updateuidpass", "addremain"])
+def process_checkjwt(message, uid, password):
+    processing_msg = bot.reply_to(
+        message,
+        f"⏳ Checking JWT for UID {uid}...\nRetries: {JWT_RETRY_ATTEMPTS} | Delay: {JWT_RETRY_DELAY_SECONDS}s",
+    )
+    data, error, attempts = check_jwt(uid, password)
+
+    if data:
+        text = format_jwt_check_result(uid, data, attempts)
+    else:
+        text = (
+            "❌ JWT CHECK FAILED\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 UID: {uid}\n"
+            f"🔁 Attempts: {attempts}/{JWT_RETRY_ATTEMPTS}\n"
+            f"⏱ Delay: {JWT_RETRY_DELAY_SECONDS}s\n\n"
+            f"Reason: {error}"
+        )
+
+    try:
+        bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
+    except Exception:
+        bot.reply_to(message, text)
+
+
+@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "updateuidpass", "addremain", "checkjwt"])
 def owner_commands(message):
     if message.from_user.id != OWNER_ID:
         return
@@ -1528,6 +1618,21 @@ def owner_commands(message):
     if cmd == "/uidpass":
         records = load_json_file(UIDPASS_FILE, [])
         bot.reply_to(message, f"UID/PASS records: {len(records)}")
+        return
+
+    if cmd == "/checkjwt":
+        if len(args) != 3:
+            bot.reply_to(message, "Use: /checkjwt <uid> <password>")
+            return
+
+        uid = args[1].strip()
+        password = args[2].strip()
+
+        if not uid.isdigit():
+            bot.reply_to(message, "UID must be numeric.")
+            return
+
+        threading.Thread(target=process_checkjwt, args=(message, uid, password), daemon=True).start()
         return
 
     if cmd == "/adduidpass":
@@ -1639,6 +1744,7 @@ def help_command(message):
             "Owner Commands:\n"
             "/remain - Show all users usage\n"
             "/uidpass - Show total UID/PASS records\n"
+            "/checkjwt <uid> <password> - Check JWT API with retry\n"
             "/adduidpass <uid> <password> - Add UID/PASS and fetch only its token\n\n"
             "/updateuidpass <uid> <new_password> - Update password after token check\n"
             "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
@@ -1678,6 +1784,7 @@ def reply_all(message):
         "/help",
         "/remain",
         "/uidpass",
+        "/checkjwt",
         "/adduidpass",
         "/updateuidpass",
         "/addremain",
