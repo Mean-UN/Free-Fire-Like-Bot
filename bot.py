@@ -48,8 +48,8 @@ AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 BIO_API_KEY = os.getenv("BIO_API_KEY", os.getenv("API_KEY", "")).strip()
 BIO_API_BASE_URL = os.getenv("BIO_API_BASE_URL", "https://bio.ffutils.tech/api/update_bio").strip()
-FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://siambhau69.eu.cc/freefireinfo/bhau").strip()
-FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "Free2026").strip()
+FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info.killersharmabot.online/player-info").strip()
+FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 FFINFO_DEFAULT_REGIONS = [
     item.strip().upper()
     for item in os.getenv("FFINFO_DEFAULT_REGIONS", "SG,IND,BD,BR,US,SAC,NA,EU,ME,TH,VN,ID,TW,RU").split(",")
@@ -254,46 +254,44 @@ def call_direct_ffinfo_api(region, uid):
     if not FFINFO_API_URL:
         return {"error": "Direct player info API is disabled."}
 
-    regions = [region.upper()] if region else FFINFO_DEFAULT_REGIONS
     last_error = {"error": "Direct player information could not be fetched."}
 
-    for lookup_region in regions:
-        api_region = "eu" if lookup_region == "EUROPE" else lookup_region.lower()
-        try:
-            logger.info(f"Calling direct FF info API: url={FFINFO_API_URL} region={lookup_region} uid={uid}")
-            params = {"uid": uid, "region": api_region}
-            if FFINFO_API_KEY:
-                params["key"] = FFINFO_API_KEY
-            response = requests.get(
-                FFINFO_API_URL,
-                params=params,
-                timeout=API_TIMEOUT_SECONDS,
-            )
-            if response.status_code != 200:
-                last_error = {
-                    "error": "Direct player information could not be fetched.",
-                    "details": {
-                        "status_code": response.status_code,
-                        "body": response.text[:180],
-                    },
-                    "status_code": response.status_code,
-                }
-                continue
-            data = response.json()
+    try:
+        logger.info(f"Calling direct FF info API: url={FFINFO_API_URL} uid={uid}")
+        params = {"uid": uid}
+        if FFINFO_API_KEY:
+            params["key"] = FFINFO_API_KEY
+        response = requests.get(
+            FFINFO_API_URL,
+            params=params,
+            timeout=API_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
             return {
-                "source": "external-direct",
-                "Region": lookup_region,
-                "data": data,
-                "status": 1,
+                "error": "Direct player information could not be fetched.",
+                "details": {
+                    "status_code": response.status_code,
+                    "body": response.text[:180],
+                },
+                "status_code": response.status_code,
             }
-        except requests.exceptions.Timeout:
-            logger.error(f"Direct FF info API timeout after {API_TIMEOUT_SECONDS}s for uid={uid} region={lookup_region}")
-            last_error = {"error": f"Direct API timed out after {API_TIMEOUT_SECONDS}s. Please try again."}
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Direct FF info API request failed: {e}")
-            last_error = {"error": "Direct player info API failed. Please try again later."}
-        except ValueError:
-            last_error = {"error": "Invalid JSON response from direct player info API."}
+        data = response.json()
+        basic_info = data.get("basicInfo", {}) if isinstance(data, dict) else {}
+        resolved_region = str(basic_info.get("region") or region or "").strip().upper()
+        return {
+            "source": "external-direct",
+            "Region": resolved_region,
+            "data": data,
+            "status": 1,
+        }
+    except requests.exceptions.Timeout:
+        logger.error(f"Direct FF info API timeout after {API_TIMEOUT_SECONDS}s for uid={uid}")
+        last_error = {"error": f"Direct API timed out after {API_TIMEOUT_SECONDS}s. Please try again."}
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Direct FF info API request failed: {e}")
+        last_error = {"error": "Direct player info API failed. Please try again later."}
+    except ValueError:
+        last_error = {"error": "Invalid JSON response from direct player info API."}
 
     return last_error
 
@@ -461,13 +459,56 @@ def br_master_stars(points):
 
 
 def cs_visible_stars(rank, points):
-    rank = to_int(rank)
     points = to_int(points)
     if points is None:
         return None
-    if rank is not None and rank >= 321:
-        return max(0, points - 87)
     return points
+
+
+def cs_rank_name(rank, points):
+    rank_code = to_int(rank)
+    if rank_code is not None:
+        if rank_code == 321:
+            stars = to_int(points)
+            if stars is not None and stars >= 100:
+                return "Heroic"
+            return "Diamond V"
+        if rank_code >= 322:
+            stars = to_int(points)
+            if stars is not None and stars >= 127:
+                return "Master"
+            return "Heroic"
+        if rank_code >= 315:
+            return f"Diamond {roman_number(rank_code - 314)}"
+        if rank_code >= 311:
+            return f"Platinum {roman_number(rank_code - 310)}"
+        if rank_code >= 307:
+            return f"Gold {roman_number(rank_code - 306)}"
+        if rank_code >= 304:
+            return f"Silver {roman_number(rank_code - 303)}"
+        if rank_code >= 301:
+            return f"Bronze {roman_number(rank_code - 300)}"
+
+    stars = to_int(points)
+    if stars is None:
+        return "N/A"
+
+    tiers = (
+        ("Bronze", 0, 3, 3),
+        ("Silver", 9, 3, 4),
+        ("Gold", 21, 4, 4),
+        ("Platinum", 37, 4, 5),
+        ("Diamond", 57, 4, 5),
+    )
+    for name, start, divisions, stars_per_division in tiers:
+        tier_total = divisions * stars_per_division
+        if start <= stars < start + tier_total:
+            division = ((stars - start) // stars_per_division) + 1
+            return f"{name} {roman_number(division)}"
+
+    if stars < 127:
+        return "Heroic"
+    return "Master"
 
 
 def rank_name(value, points=None, mode="br"):
@@ -476,26 +517,21 @@ def rank_name(value, points=None, mode="br"):
     if rank is None:
         return str(value or "N/A")
 
+    if mode == "cs":
+        return cs_rank_name(rank, rank_points)
+
     if rank >= 326:
-        if mode == "br":
-            stars = br_master_stars(rank_points)
-            if rank_points is not None and rank_points >= 8000:
-                return f"Elite Master{star_label(stars)}"
-            if rank_points is not None and rank_points >= 6300:
-                return f"Master{star_label(stars)}"
+        stars = br_master_stars(rank_points)
+        if rank_points is not None and rank_points >= 8000:
+            return f"Elite Master{star_label(stars)}"
+        if rank_points is not None and rank_points >= 6300:
+            return f"Master{star_label(stars)}"
         return "Master"
     if rank >= 321:
-        if mode == "br":
-            stars = br_heroic_stars(rank_points)
-            if stars is None:
-                stars = min(max(rank - 320, 1), 5)
-            return f"Heroic{star_label(min(stars, 5))}"
-        cs_stars = cs_visible_stars(rank, rank_points)
-        if rank >= 323:
-            if cs_stars is not None and cs_stars >= 100:
-                return f"Elite Master{star_label(cs_stars)}"
-            return f"Master{star_label(cs_stars)}"
-        return f"Heroic{star_label(cs_stars)}"
+        stars = br_heroic_stars(rank_points)
+        if stars is None:
+            stars = min(max(rank - 320, 1), 5)
+        return f"Heroic{star_label(min(stars, 5))}"
     if rank >= 318:
         return "Master"
     if rank >= 315:
@@ -549,8 +585,7 @@ def build_ffinfo_text(payload, requester):
     exp = pick(basic, "exp", "AccountEXP")
     likes = pick(basic, "liked", "likes", "AccountLikes", "Likes")
     badges = pick(basic, "badgeCnt", "badgeCount", "AccountBPBadges", "badges")
-    prime_info = pick(basic, "primeInfo", default={}) if isinstance(basic, dict) else {}
-    prime_level = pick(prime_info, "primeLevel", default=0) if isinstance(prime_info, dict) else 0
+    prime_level = pick(basic, "primeLevel.level", "primeInfo.primeLevel", default=0)
     title = pick(basic, "title", "Title", "AccountTitle", "TitleID")
     created = pick(basic, "createAt", "createdAt", "AccountCreateTime")
     last_login = pick(basic, "lastLoginAt", "lastLogin", "AccountLastLogin")

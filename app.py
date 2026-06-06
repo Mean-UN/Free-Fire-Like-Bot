@@ -27,8 +27,8 @@ TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
 TOKEN_RETRY_ATTEMPTS = int(os.getenv("TOKEN_RETRY_ATTEMPTS", "10"))
 TOKEN_RETRY_DELAY_SECONDS = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "0.7"))
-FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://siambhau69.eu.cc/freefireinfo/bhau").strip()
-FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "Free2026").strip()
+FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info.killersharmabot.online/player-info").strip()
+FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 FFINFO_DEFAULT_REGIONS = [
@@ -202,36 +202,35 @@ def fetch_external_ffinfo(uid, server_name):
     if not FFINFO_API_URL:
         return None, "", {"error": "FFINFO_API_URL is disabled"}
 
-    regions = [server_name] if server_name else FFINFO_DEFAULT_REGIONS
     last_error = {"error": "No region returned data"}
-    for region in regions:
-        params = {"uid": uid, "region": ffinfo_api_region(region)}
-        if FFINFO_API_KEY:
-            params["key"] = FFINFO_API_KEY
 
-        try:
-            response = requests.get(
-                FFINFO_API_URL,
-                params=params,
-                timeout=UPSTREAM_TIMEOUT_SECONDS,
+    params = {"uid": uid}
+    if FFINFO_API_KEY:
+        params["key"] = FFINFO_API_KEY
+
+    try:
+        response = requests.get(
+            FFINFO_API_URL,
+            params=params,
+            timeout=UPSTREAM_TIMEOUT_SECONDS,
+        )
+        if response.status_code != 200:
+            last_error = {
+                "region": normalize_region(server_name),
+                "status_code": response.status_code,
+                "body": response.text[:180],
+            }
+            app.logger.info(
+                f"FF info API returned {response.status_code}: {response.text[:180]}"
             )
-            if response.status_code != 200:
-                last_error = {
-                    "region": normalize_region(region),
-                    "status_code": response.status_code,
-                    "body": response.text[:180],
-                }
-                app.logger.info(
-                    f"FF info API returned {response.status_code} for region {region}: {response.text[:180]}"
-                )
-                continue
-            data = response.json()
-            basic_info = data.get("basicInfo", {}) if isinstance(data, dict) else {}
-            resolved_region = normalize_region(basic_info.get("region") or region)
-            return data, resolved_region, None
-        except Exception as e:
-            last_error = {"region": normalize_region(region), "error": str(e)}
-            app.logger.info(f"External FF info request failed for region {region}: {e}")
+            return None, "", last_error
+        data = response.json()
+        basic_info = data.get("basicInfo", {}) if isinstance(data, dict) else {}
+        resolved_region = normalize_region(basic_info.get("region") or server_name)
+        return data, resolved_region, None
+    except Exception as e:
+        last_error = {"region": normalize_region(server_name), "error": str(e)}
+        app.logger.info(f"External FF info request failed: {e}")
     return None, "", last_error
 
 def encrypt_message(plaintext):
