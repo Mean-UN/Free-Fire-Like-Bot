@@ -74,6 +74,11 @@ UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
 GUESTGEN_REGIONS = {"IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "BR", "BD"}
 GUESTGEN_USAGE = "ℹ️ Usage: /guestgen <region> <name>\nExample: /guestgen SG ᴍᴇᴀɴXᴜɴ!"
+GUEST_NAME_MAX_CHARS = 12
+GUEST_NAME_RETRY_ATTEMPTS = 8
+GUEST_REGION_VERIFY_ATTEMPTS = 3
+GUEST_REGION_RETRY_ATTEMPTS = int(os.getenv("GUEST_REGION_RETRY_ATTEMPTS", "10"))
+GUEST_REJECT_REGION_MISMATCH = os.getenv("GUEST_REJECT_REGION_MISMATCH", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -779,12 +784,14 @@ def save_json_file(path, data):
 def build_guest_name(base_name=""):
     base_name = "".join(char for char in str(base_name or "").strip() if char.isprintable())
     superscript_digits = "⁰¹²³⁴⁵⁶⁷⁸⁹"
-    if not base_name:
-        name_digits = "".join(superscript_digits[int(digit)] for digit in str(random.randint(1, 9999)))
-        return f"0xMe{name_digits}"
+    suffix_number = random.randint(1, 99999)
+    suffix = "".join(superscript_digits[int(digit)] for digit in str(suffix_number))
 
-    suffix = "".join(superscript_digits[int(digit)] for digit in str(random.randint(10, 99)))
-    return f"{base_name[: max(1, 12 - len(suffix))]}{suffix}"
+    if not base_name:
+        return f"0xMe{suffix}"[:GUEST_NAME_MAX_CHARS]
+
+    base_limit = max(1, GUEST_NAME_MAX_CHARS - len(suffix))
+    return f"{base_name[:base_limit]}{suffix}"
 
 
 def register_guest_account(region, base_name=""):
@@ -843,6 +850,11 @@ def register_guest_account(region, base_name=""):
             timeout=15,
         )
         if response.status_code != 200:
+            if response.status_code == 403 and "captcha-delivery.com" in response.text.lower():
+                return None, None, None, (
+                    "Guest registration is blocked by Garena captcha/IP protection. "
+                    "Wait and try later, reduce retries, or run from an allowed network."
+                )
             return None, None, None, f"Guest register failed: HTTP {response.status_code} - {response.text[:120]}"
 
         register_data = response.json()
@@ -873,47 +885,75 @@ def register_guest_account(region, base_name=""):
         if not access_token or not open_id:
             return None, None, None, "Token grant did not return access token/open_id."
 
-        guest_name = build_guest_name(base_name)
-        payload = {
-            1: guest_name,
-            2: access_token,
-            3: open_id,
-            5: 102000007,
-            6: 4,
-            7: 1,
-            13: 1,
-            14: encode_open_id(open_id),
-            15: region,
-            16: 1,
-        }
-        encrypted_data = bytes.fromhex(aes_encrypt_hex(encode_payload(payload).hex()))
         major_headers = {
             "Authorization": f"Bearer {access_token}",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
             "ReleaseVersion": "OB53",
             "Content-Type": "application/octet-stream",
-            "Content-Length": str(len(encrypted_data)),
             "User-Agent": user_agent,
             "Host": "loginbp.ggblueshark.com",
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
         }
-        response = None
-        for attempt in range(3):
-            response = session.post(
-                "https://loginbp.ggblueshark.com/MajorRegister",
-                data=encrypted_data,
-                headers=major_headers,
-                timeout=15,
-            )
-            if response.status_code != 503:
-                break
-            time.sleep(2 * (attempt + 1))
+        last_error = ""
+        guest_name = ""
+        for name_attempt in range(1, GUEST_NAME_RETRY_ATTEMPTS + 1):
+            guest_name = build_guest_name(base_name)
+            payload = {
+                1: guest_name,
+                2: access_token,
+                3: open_id,
+                5: 102000007,
+                6: 4,
+                7: 1,
+                13: 1,
+                14: encode_open_id(open_id),
+                15: region,
+                16: 1,
+            }
+            encrypted_data = bytes.fromhex(aes_encrypt_hex(encode_payload(payload).hex()))
+            major_headers["Content-Length"] = str(len(encrypted_data))
 
-        if response.status_code == 200:
-            return str(uid), password_hash, guest_name, None
-        return str(uid), password_hash, guest_name, f"Major register failed: HTTP {response.status_code} - {response.text[:120]}"
+            response = None
+            for attempt in range(3):
+                response = session.post(
+                    "https://loginbp.ggblueshark.com/MajorRegister",
+                    data=encrypted_data,
+                    headers=major_headers,
+                    timeout=15,
+                )
+                if response.status_code != 503:
+                    break
+                time.sleep(2 * (attempt + 1))
+
+            if response.status_code == 200:
+                if GUEST_REJECT_REGION_MISMATCH:
+                    token_data, token_error, _ = check_jwt(
+                        str(uid),
+                        password_hash,
+                        attempts=GUEST_REGION_VERIFY_ATTEMPTS,
+                        delay=JWT_RETRY_DELAY_SECONDS,
+                    )
+                    actual_region = str((token_data or {}).get("region") or "").strip().upper()
+                    if actual_region and actual_region != region:
+                        return (
+                            None,
+                            None,
+                            None,
+                            f"Requested {region}, but Garena created this guest in {actual_region}. "
+                            "The account was rejected so it is not returned as a valid guest. "
+                            "This is usually caused by the server/IP used for guest registration.",
+                        )
+                    if not token_data:
+                        return None, None, None, f"Guest created but region verification failed: {token_error}"
+                return str(uid), password_hash, guest_name, None
+
+            last_error = f"HTTP {response.status_code} - {response.text[:120]}"
+            if response.status_code in {401, 403}:
+                break
+
+        return str(uid), password_hash, guest_name, f"Major register failed after name retries: {last_error}"
     except requests.exceptions.Timeout:
         return None, None, None, "Guest generation timed out."
     except requests.exceptions.RequestException as e:
@@ -1538,12 +1578,53 @@ def handle_guestgen(message):
 
 def process_guestgen(message, region, base_name=""):
     processing_msg = bot.reply_to(message, f"Please wait... Generating guest account for {region}.")
-    uid, password, guest_name, error = register_guest_account(region, base_name)
+    uid = password = guest_name = None
+    error = ""
+    actual_region = ""
+    last_region = ""
+
+    for attempt in range(1, GUEST_REGION_RETRY_ATTEMPTS + 1):
+        uid, password, guest_name, error = register_guest_account(region, base_name)
+        if not uid or not password:
+            break
+
+        token_data, verify_error, _ = check_jwt(str(uid), password, attempts=1, delay=0)
+        actual_region = str((token_data or {}).get("region") or "").strip().upper()
+        last_region = actual_region or "UNKNOWN"
+        if actual_region == region:
+            break
+
+        logger.info(
+            f"Guest region mismatch for UID {uid}: requested={region} actual={last_region} "
+            f"attempt={attempt}/{GUEST_REGION_RETRY_ATTEMPTS}"
+        )
+        if attempt < GUEST_REGION_RETRY_ATTEMPTS:
+            try:
+                bot.edit_message_text(
+                    text=(
+                        f"Please wait... Generating guest account for {region}.\n"
+                        f"Retry {attempt}/{GUEST_REGION_RETRY_ATTEMPTS}..."
+                    ),
+                    chat_id=processing_msg.chat.id,
+                    message_id=processing_msg.message_id,
+                )
+            except Exception:
+                pass
+            continue
+
+        error = (
+            f"Could not create {region} guest after {GUEST_REGION_RETRY_ATTEMPTS} attempts. "
+            f"Last created region: {last_region}. "
+            "Try running the bot from a server/IP that Garena maps to this region."
+        )
+        uid = password = guest_name = None
+        if verify_error and not actual_region:
+            error += f" Region check error: {verify_error}"
 
     if uid and password and error:
         text = (
             "Guest account generated\n\n"
-            f"Region: {region}\n"
+            f"Region: {actual_region or region}\n"
             f"Name: {guest_name}\n"
             f"UID: {uid}\n"
             f"Password: {password}\n\n"
@@ -1554,7 +1635,7 @@ def process_guestgen(message, region, base_name=""):
     else:
         text = (
             "Guest account generated\n\n"
-            f"Region: {region}\n"
+            f"Region: {actual_region or region}\n"
             f"Name: {guest_name}\n"
             f"UID: {uid}\n"
             f"Password: {password}"
