@@ -5,9 +5,10 @@ import random
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, quote, urlparse
 import hashlib
+import html
 import hmac
 
 import requests
@@ -15,7 +16,14 @@ import telebot
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from flask import Flask, jsonify, request
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from requests.adapters import HTTPAdapter
+from telebot.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
+from urllib3.util.retry import Retry
+
+try:
+    import MajorLoginRes_pb2
+except Exception:
+    MajorLoginRes_pb2 = None
 
 
 def load_env_file(path=".env"):
@@ -72,12 +80,32 @@ OWNER_ID = 1126297297
 OWNER_USERNAME = "@mean_un"
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
-GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "BR", "BD")
+GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD")
+GUESTGEN_REGION_LANG = {
+    "IND": "hi",
+    "SG": "en",
+    "RU": "ru",
+    "ID": "id",
+    "TW": "zh",
+    "US": "en",
+    "VN": "vi",
+    "TH": "th",
+    "ME": "ar",
+    "PK": "ur",
+    "CIS": "ru",
+    "SAC": "es",
+    "BR": "pt",
+    "BD": "bn",
+}
 GUESTGEN_USAGE = (
     "ℹ️ Usage: /guestgen <region> <name>\n"
-    "Regions: IND, SG, RU, ID, TW, US, VN, TH, ME, PK, CIS, BR, BD\n"
+    "Regions: IND, SG, RU, ID, TW, US, VN, TH, ME, PK, CIS, SAC, BR, BD\n"
     "Example: /guestgen SG ᴍᴇᴀɴXᴜɴ!"
 )
+if set(GUESTGEN_REGIONS) != set(GUESTGEN_REGION_LANG):
+    missing_lang = sorted(set(GUESTGEN_REGIONS) - set(GUESTGEN_REGION_LANG))
+    extra_lang = sorted(set(GUESTGEN_REGION_LANG) - set(GUESTGEN_REGIONS))
+    raise RuntimeError(f"Guestgen region/language mismatch. missing={missing_lang} extra={extra_lang}")
 RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB53").strip() or "OB53"
 MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
 MAIN_IV = b"6oyZDr22E3ychjM%"
@@ -95,19 +123,43 @@ MAJOR_LOGIN_URLS = (
     "https://loginbp.ggpolarbear.com/MajorLogin",
     "https://loginbp.ggblueshark.com/MajorLogin",
 )
+COMMON_MAJOR_REGISTER_URL = "https://loginbp.common.ggbluefox.com/MajorRegister"
+COMMON_MAJOR_LOGIN_URL = "https://loginbp.common.ggbluefox.com/MajorLogin"
+COMMON_MAJOR_REGISTER_REGIONS = {"ME", "TH"}
+COMMON_MAJOR_LOGIN_REGIONS = {"IND", "ME", "TH", "TW", "CIS", "SAC"}
+GUESTGEN_HTTP_RETRIES = int(os.getenv("GUESTGEN_HTTP_RETRIES", "2"))
+GUESTGEN_POOL_SIZE = int(os.getenv("GUESTGEN_POOL_SIZE", "10"))
+GUESTGEN_ACCOUNT_ATTEMPTS = int(os.getenv("GUESTGEN_ACCOUNT_ATTEMPTS", "3"))
+GUESTGEN_PROXY_ROTATION_ENABLED = os.getenv("GUESTGEN_PROXY_ROTATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+GUESTGEN_PROXY_ROTATE_EVERY = max(1, int(os.getenv("GUESTGEN_PROXY_ROTATE_EVERY", "1")))
+GUESTGEN_TOR_PROXY_URL = os.getenv("GUESTGEN_TOR_PROXY_URL", "socks5h://127.0.0.1:9050").strip()
+GUESTGEN_TOR_CONTROL_HOST = os.getenv("GUESTGEN_TOR_CONTROL_HOST", "127.0.0.1").strip()
+GUESTGEN_TOR_CONTROL_PORT = int(os.getenv("GUESTGEN_TOR_CONTROL_PORT", "9051"))
+GUESTGEN_TOR_CONTROL_PASSWORD = os.getenv("GUESTGEN_TOR_CONTROL_PASSWORD", "")
+GUESTGEN_TOR_RENEW_WAIT_SECONDS = float(os.getenv("GUESTGEN_TOR_RENEW_WAIT_SECONDS", "3"))
+GUESTGEN_MAJOR_LOGIN_USER_AGENTS = (
+    "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
+    "Dalvik/2.1.0 (Linux; U; Android 12; ASUS_Z01QD Build/SKQ1.210216.001)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; SM-G998B Build/TP1A.220624.014)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; M2012K11AG Build/TKQ1.220829.002)",
+    "Dalvik/2.1.0 (Linux; U; Android 12; RMX3393 Build/SP1A.210812.016)",
+)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 # In-memory daily usage tracker
 like_tracker = {}
+guestgen_proxy_lock = threading.Lock()
+guestgen_proxy_use_count = 0
+guestgen_proxy_disabled_until = 0
 
 
 def reset_limits():
     """Reset in-memory usage counters daily at 00:00 UTC."""
     while True:
         try:
-            now_utc = datetime.utcnow()
+            now_utc = datetime.now(timezone.utc)
             next_reset = (now_utc + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
             sleep_seconds = (next_reset - now_utc).total_seconds()
             time.sleep(max(1, sleep_seconds))
@@ -198,6 +250,37 @@ def parse_protobuf_scalars(data):
 
 
 def decode_major_login_info(raw_bytes):
+    if MajorLoginRes_pb2 is not None:
+        try:
+            message = MajorLoginRes_pb2.MajorLoginRes()
+            message.ParseFromString(raw_bytes)
+            return {
+                "account_id": str(message.account_id or ""),
+                "region": message.lock_region,
+                "lock_region": message.lock_region,
+                "noti_region": message.noti_region,
+                "ip_region": message.ip_region,
+                "agora_environment": message.agora_environment,
+                "new_active_region": message.new_active_region,
+                "token": message.token,
+                "ttl": message.ttl,
+                "server_url": message.server_url,
+                "emulator_score": message.emulator_score,
+                "tp_url": message.tp_url,
+                "app_server_id": message.app_server_id,
+                "ano_url": message.ano_url,
+                "ip_city": message.ip_city,
+                "ip_subdivision": message.ip_subdivision,
+                "timestamp": message.kts,
+                "kts": message.kts,
+                "key": message.ak,
+                "iv": message.aiv,
+                "ak": message.ak,
+                "aiv": message.aiv,
+            }
+        except Exception as e:
+            logger.info(f"MajorLoginRes protobuf decode failed, using fallback parser: {e}")
+
     fields = parse_protobuf_scalars(raw_bytes)
 
     def text_field(field):
@@ -219,11 +302,18 @@ def decode_major_login_info(raw_bytes):
     return {
         "account_id": str(int_field(1) or ""),
         "region": text_field(2),
+        "lock_region": text_field(2),
+        "noti_region": text_field(3),
+        "ip_region": text_field(4),
         "token": text_field(8),
+        "ttl": int_field(9),
         "server_url": text_field(10),
+        "emulator_score": int_field(12),
         "timestamp": int_field(21),
         "key": (fields.get(22) or [b""])[-1],
         "iv": (fields.get(23) or [b""])[-1],
+        "ak": (fields.get(22) or [b""])[-1],
+        "aiv": (fields.get(23) or [b""])[-1],
     }
 
 
@@ -262,7 +352,7 @@ def get_bio_jwt(access_token):
 
     encrypted_payload = build_major_login_payload(open_id, access_token, platform=platform)
     last_error = ""
-    for login_url in MAJOR_LOGIN_URLS:
+    for login_url in ordered_major_login_urls():
         host = urlparse(login_url).netloc
         try:
             response = requests.post(
@@ -1067,6 +1157,160 @@ def response_brief(response, limit=160):
     return f"HTTP {response.status_code} - {text[:limit]}"
 
 
+def response_json_or_error(response, label):
+    try:
+        return response.json(), ""
+    except ValueError:
+        return None, f"{label} returned invalid JSON: {response_brief(response)}"
+
+
+def short_guestgen_warning(error):
+    text = str(error or "").strip()
+    if not text:
+        return ""
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            message = data.get("msg") or data.get("message") or data.get("type")
+            if message:
+                return str(message).replace("_", " ")
+        except ValueError:
+            pass
+
+    lowered = text.lower()
+    if "account_not_found" in lowered or "account not found" in lowered:
+        return "account not found"
+    if "missing account_id" in lowered or "did not return account_id" in lowered:
+        return "account id not returned"
+    if text.startswith("MajorLogin check failed:"):
+        text = text.split(":", 1)[1].strip()
+    if " - " in text:
+        text = text.rsplit(" - ", 1)[-1].strip()
+    return text[:120]
+
+
+def redact_proxy_url(proxy_url):
+    if not proxy_url:
+        return "direct"
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname:
+        return "proxy"
+    host = parsed.hostname
+    port = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{host}{port}"
+
+
+def renew_guestgen_tor_ip():
+    try:
+        import socket
+
+        with socket.create_connection((GUESTGEN_TOR_CONTROL_HOST, GUESTGEN_TOR_CONTROL_PORT), timeout=10) as sock:
+            password = GUESTGEN_TOR_CONTROL_PASSWORD.replace('"', '\\"')
+            if password:
+                sock.sendall(f'AUTHENTICATE "{password}"\r\n'.encode())
+            else:
+                sock.sendall(b'AUTHENTICATE ""\r\n')
+            auth_response = sock.recv(1024)
+            if not auth_response.startswith(b"250"):
+                return False, f"Tor authenticate failed: {auth_response.decode(errors='ignore').strip()}"
+
+            sock.sendall(b"SIGNAL NEWNYM\r\n")
+            newnym_response = sock.recv(1024)
+            if not newnym_response.startswith(b"250"):
+                return False, f"Tor NEWNYM failed: {newnym_response.decode(errors='ignore').strip()}"
+
+            sock.sendall(b"QUIT\r\n")
+
+        time.sleep(max(0, GUESTGEN_TOR_RENEW_WAIT_SECONDS))
+        return True, "Tor NEWNYM sent"
+    except Exception as e:
+        return False, str(e)
+
+
+def is_guestgen_tor_proxy_ready():
+    try:
+        import socket
+
+        parsed = urlparse(GUESTGEN_TOR_PROXY_URL)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 9050
+        with socket.create_connection((host, port), timeout=1.5):
+            return True
+    except Exception:
+        return False
+
+
+def disable_guestgen_proxy_temporarily(reason, seconds=60):
+    global guestgen_proxy_disabled_until
+    guestgen_proxy_disabled_until = time.time() + max(1, seconds)
+    logger.warning(f"/guestgen proxy disabled temporarily, using direct network: {reason}")
+
+
+def is_socks_proxy_error(error):
+    text = str(error).lower()
+    return "socks" in text or "proxy" in text or "127.0.0.1:9050" in text
+
+
+def get_guestgen_proxy():
+    global guestgen_proxy_use_count
+    if not GUESTGEN_PROXY_ROTATION_ENABLED or not GUESTGEN_TOR_PROXY_URL:
+        return ""
+    if time.time() < guestgen_proxy_disabled_until:
+        return ""
+    if not is_guestgen_tor_proxy_ready():
+        disable_guestgen_proxy_temporarily("Tor SOCKS port is not reachable")
+        return ""
+
+    with guestgen_proxy_lock:
+        guestgen_proxy_use_count += 1
+        if guestgen_proxy_use_count >= GUESTGEN_PROXY_ROTATE_EVERY:
+            guestgen_proxy_use_count = 0
+            ok, detail = renew_guestgen_tor_ip()
+            if ok:
+                logger.info(f"/guestgen Tor rotation: {detail}")
+            else:
+                logger.warning(f"/guestgen Tor rotation failed: {detail}")
+        return GUESTGEN_TOR_PROXY_URL
+
+
+def ordered_major_register_urls(region):
+    if str(region or "").upper() in COMMON_MAJOR_REGISTER_REGIONS:
+        return (COMMON_MAJOR_REGISTER_URL, *MAJOR_REGISTER_URLS)
+    return MAJOR_REGISTER_URLS
+
+
+def ordered_major_login_urls(region=None):
+    if str(region or "").upper() in COMMON_MAJOR_LOGIN_REGIONS:
+        return (COMMON_MAJOR_LOGIN_URL, *MAJOR_LOGIN_URLS)
+    return MAJOR_LOGIN_URLS
+
+
+def configure_guestgen_session(session, proxy_url=""):
+    retry = Retry(
+        total=GUESTGEN_HTTP_RETRIES,
+        connect=GUESTGEN_HTTP_RETRIES,
+        read=GUESTGEN_HTTP_RETRIES,
+        status=GUESTGEN_HTTP_RETRIES,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=None,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=GUESTGEN_POOL_SIZE,
+        pool_maxsize=GUESTGEN_POOL_SIZE,
+    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    if proxy_url:
+        session.proxies.update({"http": proxy_url, "https": proxy_url})
+    return session
+
+
 def encode_varint(number):
     result = bytearray()
     while number:
@@ -1121,8 +1365,9 @@ def extract_guest_token_credentials(token_data):
     return access_token, open_id
 
 
-def build_major_login_payload(open_id, access_token, platform=None):
+def build_major_login_payload(open_id, access_token, platform=None, language="en"):
     platform = str(platform or "4")
+    language = str(language or "en")
     payload = {
         3: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         4: "free fire",
@@ -1141,7 +1386,7 @@ def build_major_login_payload(open_id, access_token, platform=None):
         18: "OpenGL ES 3.1 v1.46",
         19: "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57",
         20: "223.191.51.89",
-        21: "en",
+        21: language,
         22: open_id,
         23: "4",
         24: "Handheld",
@@ -1183,36 +1428,61 @@ def build_major_login_payload(open_id, access_token, platform=None):
     return aes_encrypt_payload(encode_proto_payload(payload))
 
 
-def verify_guest_major_login(session, access_token, open_id):
-    encrypted_payload = build_major_login_payload(open_id, access_token)
+def build_legacy_major_login_payload(open_id, access_token, language="en"):
+    lang = str(language or "en").encode("ascii", errors="ignore") or b"en"
+    payload_parts = [
+        b'\x1a\x132025-08-30 05:19:21"\tfree fire(\x01:\x081.114.13B2Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)J\x08HandheldR\nATM MobilsZ\x04WIFI`\xb6\nh\xee\x05r\x03300z\x1fARMv7 VFPv3 NEON VMH | 2400 | 2\x80\x01\xc9\x0f\x8a\x01\x0fAdreno (TM) 640\x92\x01\rOpenGL ES 3.2\x9a\x01+Google|dfa4ab4b-9dc4-454e-8065-e70c733fa53f\xa2\x01\x0e105.235.139.91\xaa\x01\x02',
+        lang,
+        b'\xb2\x01 1d8ec0240ede109973f3321b9354b44d\xba\x01\x014\xc2\x01\x08Handheld\xca\x01\x10Asus ASUS_I005DA\xea\x01@afcfbf13334be42036e4f742c80b956344bed760ac91b3aff9b607a610ab4390\xf0\x01\x01\xca\x02\nATM Mobils\xd2\x02\x04WIFI\xca\x03 7428b253defc164018c604a1ebbfebdf\xe0\x03\xa8\x81\x02\xe8\x03\xf6\xe5\x01\xf0\x03\xaf\x13\xf8\x03\x84\x07\x80\x04\xe7\xf0\x01\x88\x04\xa8\x81\x02\x90\x04\xe7\xf0\x01\x98\x04\xa8\x81\x02\xc8\x04\x01\xd2\x04=/data/app/com.dts.freefireth-PdeDnOilCSFn37p1AH_FLg==/lib/arm\xe0\x04\x01\xea\x04_2087f61c19f57f2af4e7feff0b24d9d9|/data/app/com.dts.freefireth-PdeDnOilCSFn37p1AH_FLg==/base.apk\xf0\x04\x03\xf8\x04\x01\x8a\x05\x0232\x9a\x05\n2019118692\xb2\x05\tOpenGLES2\xb8\x05\xff\x7f\xc0\x05\x04\xe0\x05\xf3F\xea\x05\x07android\xf2\x05pKqsHT5ZLWrYljNb5Vqh//yFRlaPHSO9NWSQsVvOmdhEEn7W+VHNUK+Q+fduA3ptNrGB0Ll0LRz3WW0jOwesLj6aiU7sZ40p8BfUE/FI/jzSTwRe2\xf8\x05\xfb\xe4\x06\x88\x06\x01\x90\x06\x01\x9a\x06\x014\xa2\x06\x014\xb2\x06"GQ@O\x00\x0e^\x00D\x06UA\x0ePM\r\x13hZ\x07T\x06\x0cm\\V\x0ejYV;\x0bU5',
+    ]
+    payload = b"".join(payload_parts)
+    payload = payload.replace(b"afcfbf13334be42036e4f742c80b956344bed760ac91b3aff9b607a610ab4390", access_token.encode())
+    payload = payload.replace(b"1d8ec0240ede109973f3321b9354b44d", open_id.encode())
+    return aes_encrypt_payload(payload)
+
+
+def get_guest_major_login_info(session, access_token, open_id, region="", language="en"):
+    payload_builders = (
+        ("protobuf", build_major_login_payload),
+        ("legacy-template", build_legacy_major_login_payload),
+    )
     last_error = ""
-    for login_url in MAJOR_LOGIN_URLS:
-        host = urlparse(login_url).netloc
-        try:
-            response = session.post(
-                login_url,
-                data=encrypted_payload,
-                headers={
-                    "Accept-Encoding": "gzip",
-                    "Authorization": "Bearer",
-                    "Connection": "Keep-Alive",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "Content-Length": str(len(encrypted_payload)),
-                    "Expect": "100-continue",
-                    "Host": host,
-                    "ReleaseVersion": RELEASE_VERSION,
-                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
-                    "X-GA": "v1 1",
-                    "X-Unity-Version": "2018.4.11f1",
-                },
-                timeout=20,
-            )
-            if response.status_code == 200 and response.content:
-                return True, ""
-            last_error = response_brief(response)
-        except requests.exceptions.RequestException as e:
-            last_error = str(e)
-    return False, last_error or "no response"
+    for payload_name, payload_builder in payload_builders:
+        encrypted_payload = payload_builder(open_id, access_token, language=language)
+        for login_url in ordered_major_login_urls(region):
+            host = urlparse(login_url).netloc
+            try:
+                response = session.post(
+                    login_url,
+                    data=encrypted_payload,
+                    headers={
+                        "Accept-Encoding": "gzip",
+                        "Authorization": "Bearer",
+                        "Connection": "Keep-Alive",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Content-Length": str(len(encrypted_payload)),
+                        "Expect": "100-continue",
+                        "Host": host,
+                        "ReleaseVersion": RELEASE_VERSION,
+                        "User-Agent": random.choice(GUESTGEN_MAJOR_LOGIN_USER_AGENTS),
+                        "X-GA": "v1 1",
+                        "X-Unity-Version": "2018.4.11f1",
+                    },
+                    timeout=20,
+                )
+                if response.status_code == 200 and response.content:
+                    login_info = decode_major_login_info(response.content)
+                    if login_info.get("account_id") or login_info.get("token"):
+                        login_info["major_login_payload"] = payload_name
+                        return login_info, ""
+                    last_error = f"MajorLogin {payload_name} response missing account_id/token."
+                    continue
+                last_error = f"MajorLogin {payload_name}: {response_brief(response)}"
+            except requests.exceptions.RequestException as e:
+                last_error = f"MajorLogin {payload_name}: {e}"
+            except Exception as e:
+                last_error = f"MajorLogin {payload_name} decode failed: {e}"
+    return {}, last_error or "no response"
 
 
 def register_guest_account(region, base_name=""):
@@ -1220,9 +1490,14 @@ def register_guest_account(region, base_name=""):
     client_id = "100067"
     user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
     major_user_agent = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
-    session = requests.Session()
+    proxy_url = get_guestgen_proxy()
+    proxy_label = redact_proxy_url(proxy_url)
+    session = configure_guestgen_session(requests.Session(), proxy_url=proxy_url)
 
     try:
+        if proxy_url:
+            logger.info(f"/guestgen using proxy {proxy_label}")
+        language = GUESTGEN_REGION_LANG.get(region.upper(), "en")
         password = str(random.randint(1000000000, 9999999999))
         password_hash = hashlib.sha256(password.encode()).hexdigest().upper()
 
@@ -1234,7 +1509,10 @@ def register_guest_account(region, base_name=""):
             "Host": "100067.connect.garena.com",
             "User-Agent": user_agent,
             "Authorization": f"Signature {hmac.new(secret, body.encode(), hashlib.sha256).hexdigest()}",
-            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Content-Type": "application/json; charset=utf-8",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
         }
 
         response = session.post(
@@ -1244,12 +1522,14 @@ def register_guest_account(region, base_name=""):
             timeout=15,
         )
         if response.status_code != 200:
-            return None, None, None, f"Guest register failed: {response_brief(response)}"
+            return None, None, None, {}, f"Guest register failed: {response_brief(response)}"
 
-        register_data = response.json()
+        register_data, json_error = response_json_or_error(response, "Guest register")
+        if json_error:
+            return None, None, None, {}, json_error
         uid = (register_data.get("data") or {}).get("uid") or register_data.get("uid")
         if not uid:
-            return None, None, None, "Guest register did not return UID."
+            return None, None, None, {}, "Guest register did not return UID."
 
         token_body = {
             "uid": str(uid),
@@ -1309,12 +1589,14 @@ def register_guest_account(region, base_name=""):
                 last_token_error = str(e)
 
         if response is None or response.status_code != 200:
-            return None, None, None, f"Token grant failed: {last_token_error or response_brief(response)}"
+            return None, None, None, {}, f"Token grant failed: {last_token_error or response_brief(response)}"
 
-        token_data = response.json()
+        token_data, json_error = response_json_or_error(response, "Token grant")
+        if json_error:
+            return None, None, None, {}, json_error
         access_token, open_id = extract_guest_token_credentials(token_data)
         if not access_token or not open_id:
-            return None, None, None, "Token grant did not return access token/open_id."
+            return None, None, None, {}, "Token grant did not return access token/open_id."
 
         major_headers = {
             "Authorization": f"Bearer {access_token}",
@@ -1348,14 +1630,14 @@ def register_guest_account(region, base_name=""):
                 7: 1,
                 13: 1,
                 14: encode_open_id(open_id),
-                15: region,
+                15: language,
                 16: 1,
                 17: 1,
             }
             encrypted_data = aes_encrypt_payload(encode_proto_payload(payload))
             major_headers["Content-Length"] = str(len(encrypted_data))
 
-            for major_url in MAJOR_REGISTER_URLS:
+            for major_url in ordered_major_register_urls(region):
                 major_headers["Host"] = urlparse(major_url).netloc
                 for auth_value in (f"Bearer {access_token}", "Bearer"):
                     major_headers["Authorization"] = auth_value
@@ -1387,20 +1669,39 @@ def register_guest_account(region, base_name=""):
                 break
 
         if response is not None and response.status_code == 200:
-            login_ok, login_error = verify_guest_major_login(session, access_token, open_id)
-            if not login_ok:
-                return str(uid), password_hash, guest_name, f"MajorLogin check failed: {login_error}"
-            return str(uid), password_hash, guest_name, None
-        return str(uid), password_hash, guest_name, f"Major register failed: {response_brief(response) if response is not None else last_major_error or 'no response'}"
+            login_info, login_error = get_guest_major_login_info(session, access_token, open_id, region=region, language=language)
+            if proxy_url:
+                login_info["proxy"] = proxy_label
+            if login_error:
+                return str(uid), password_hash, guest_name, login_info, f"MajorLogin check failed: {login_error}"
+            return str(uid), password_hash, guest_name, login_info, None
+        return str(uid), password_hash, guest_name, {}, f"Major register failed: {response_brief(response) if response is not None else last_major_error or 'no response'}"
     except requests.exceptions.Timeout:
-        return None, None, None, "Guest generation timed out."
+        return None, None, None, {}, "Guest generation timed out."
     except requests.exceptions.RequestException as e:
-        return None, None, None, f"Guest generation request failed: {e}"
+        if proxy_url and is_socks_proxy_error(e):
+            disable_guestgen_proxy_temporarily(e)
+        return None, None, None, {}, f"Guest generation request failed: {e}"
     except Exception as e:
         logger.error(f"Guest generation failed: {e}", exc_info=True)
-        return None, None, None, "Guest generation failed. Check bot logs."
+        return None, None, None, {}, "Guest generation failed. Check bot logs."
     finally:
         session.close()
+
+
+def register_guest_account_with_retry(region, base_name=""):
+    last_result = (None, None, None, {}, "Guest generation did not start.")
+    for attempt in range(1, max(1, GUESTGEN_ACCOUNT_ATTEMPTS) + 1):
+        result = register_guest_account(region, base_name)
+        uid, password, guest_name, login_info, error = result
+        if uid and password:
+            return result
+
+        last_result = result
+        if attempt < GUESTGEN_ACCOUNT_ATTEMPTS:
+            time.sleep(0.7 * attempt)
+
+    return last_result
 
 
 def add_uidpass_entry(uid, password):
@@ -1682,7 +1983,7 @@ def start_command(message):
         return
 
     if user_id not in like_tracker:
-        like_tracker[user_id] = {"used": 0, "last_used": datetime.utcnow() - timedelta(days=1)}
+        like_tracker[user_id] = {"used": 0, "last_used": datetime.now(timezone.utc) - timedelta(days=1)}
 
     bot.reply_to(message, "You are verified. Use /like to send likes.")
 
@@ -1817,7 +2118,7 @@ def process_ffinfo(message, region, uid):
 
 def process_like(message, region, uid):
     user_id = message.from_user.id
-    now_utc = datetime.utcnow()
+    now_utc = datetime.now(timezone.utc)
     usage = like_tracker.get(user_id, {"used": 0, "last_used": now_utc - timedelta(days=1)})
 
     if now_utc.date() > usage["last_used"].date():
@@ -2028,48 +2329,77 @@ def handle_guestgen(message):
 
 
 def process_guestgen(message, region, base_name=""):
-    processing_msg = bot.reply_to(message, f"Please wait... Generating guest account for {region}.")
-    uid, password, guest_name, error = register_guest_account(region, base_name)
-    account_id = ""
-    jwt_error = ""
-
+    processing_msg = bot.reply_to(
+        message,
+        f"Please wait... Generating guest account for {region}.",
+    )
+    uid, password, guest_name, login_info, error = register_guest_account_with_retry(region, base_name)
+    account_id = str((login_info or {}).get("account_id") or "").strip()
+    login_region = str((login_info or {}).get("lock_region") or (login_info or {}).get("region") or region).strip().upper()
+    proxy_label = str((login_info or {}).get("proxy") or "").strip()
+    proxy_line = f"Proxy: {html.escape(proxy_label)}\n" if proxy_label else ""
+    safe_region = html.escape(login_region or region)
+    safe_guest_name = html.escape(str(guest_name or "N/A"))
+    safe_account_id = html.escape(account_id or "N/A")
+    safe_uid = html.escape(str(uid or "N/A"))
+    safe_password = html.escape(str(password or "N/A"))
+    reply_markup = None
     if uid and password:
-        jwt_data, jwt_error, _ = check_jwt(uid, password)
-        account_id = extract_jwt_account_id(jwt_data)
+        copy_payload = json.dumps(
+            {
+                "guest_account_info": {
+                    "com.garena.msdk.guest_password": str(password),
+                    "com.garena.msdk.guest_uid": str(uid),
+                }
+            },
+            separators=(",", ":"),
+        )
+        reply_markup = InlineKeyboardMarkup()
+        reply_markup.add(InlineKeyboardButton("Copy guest_account_info", copy_text=CopyTextButton(copy_payload)))
 
     if uid and password and error:
-        warning_lines = [error]
-        if not account_id:
-            warning_lines.append(f"JWT account check failed: {jwt_error or 'account_id missing'}")
+        warning = short_guestgen_warning(error)
+        warning_lines = [warning] if warning else []
+        if not account_id and warning != "account not found":
+            warning_lines.append("MajorLogin response did not return account_id")
+        warning_text = html.escape("; ".join(warning_lines))
         text = (
             "Guest account generated\n\n"
-            f"Region: {region}\n"
-            f"Name: {guest_name}\n"
-            f"Account ID: {account_id or 'N/A'}\n"
-            f"UID: {uid}\n"
-            f"Password: {password}\n\n"
-            f"Warning: {'; '.join(warning_lines)}"
+            f"Region: {safe_region}\n"
+            f"{proxy_line}"
+            f"Name: {safe_guest_name}\n"
+            f"Account ID: <code>{safe_account_id}</code>\n"
+            f"UID: <code>{safe_uid}</code>\n"
+            f"Password: <code>{safe_password}</code>\n\n"
+            f"Warning: {warning_text}"
         )
     elif error:
-        text = f"Guest generation failed\n\nRegion: {region}\nReason: {error}"
+        text = f"Guest generation failed\n\nRegion: {html.escape(region)}\nReason: {html.escape(str(error))}"
     else:
         warning_text = ""
         if not account_id:
-            warning_text = f"\n\nWarning: JWT account check failed: {jwt_error or 'account_id missing'}"
+            warning_text = "\n\nWarning: account id not returned"
         text = (
             "Guest account generated\n\n"
-            f"Region: {region}\n"
-            f"Name: {guest_name}\n"
-            f"Account ID: {account_id or 'N/A'}\n"
-            f"UID: {uid}\n"
-            f"Password: {password}"
+            f"Region: {safe_region}\n"
+            f"{proxy_line}"
+            f"Name: {safe_guest_name}\n"
+            f"Account ID: <code>{safe_account_id}</code>\n"
+            f"UID: <code>{safe_uid}</code>\n"
+            f"Password: <code>{safe_password}</code>"
             f"{warning_text}"
         )
 
     try:
-        bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
+        bot.edit_message_text(
+            text=text,
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
     except Exception:
-        bot.reply_to(message, text)
+        bot.reply_to(message, text, parse_mode="HTML", reply_markup=reply_markup)
 
 
 def process_checkjwt(message, uid, password):
@@ -2224,7 +2554,7 @@ def owner_commands(message):
 
         # Update the user's daily limit
         if user_id not in like_tracker:
-            like_tracker[user_id] = {"used": 0, "last_used": datetime.utcnow() - timedelta(days=1)}
+            like_tracker[user_id] = {"used": 0, "last_used": datetime.now(timezone.utc) - timedelta(days=1)}
         
         like_tracker[user_id]["used"] = max(0, get_user_limit(user_id) - n)
         bot.reply_to(message, f"✅ User {user_id}: Remaining requests set to {n}")
