@@ -72,8 +72,29 @@ OWNER_ID = 1126297297
 OWNER_USERNAME = "@mean_un"
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
-GUESTGEN_REGIONS = {"IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "BR", "BD"}
-GUESTGEN_USAGE = "ℹ️ Usage: /guestgen <region> <name>\nExample: /guestgen SG ᴍᴇᴀɴXᴜɴ!"
+GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "BR", "BD")
+GUESTGEN_USAGE = (
+    "ℹ️ Usage: /guestgen <region> <name>\n"
+    "Regions: IND, SG, RU, ID, TW, US, VN, TH, ME, PK, CIS, BR, BD\n"
+    "Example: /guestgen SG ᴍᴇᴀɴXᴜɴ!"
+)
+RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB53").strip() or "OB53"
+MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
+MAIN_IV = b"6oyZDr22E3ychjM%"
+GUEST_REGISTER_URL = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
+GUEST_TOKEN_GRANT_URLS = (
+    "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant",
+    "https://100067.connect.garena.com/oauth/guest/token/grant",
+    "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant",
+)
+MAJOR_REGISTER_URLS = (
+    "https://loginbp.ggblueshark.com/MajorRegister",
+    "https://loginbp.ggpolarbear.com/MajorRegister",
+)
+MAJOR_LOGIN_URLS = (
+    "https://loginbp.ggpolarbear.com/MajorLogin",
+    "https://loginbp.ggblueshark.com/MajorLogin",
+)
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -783,43 +804,187 @@ def build_guest_name(base_name=""):
         name_digits = "".join(superscript_digits[int(digit)] for digit in str(random.randint(1, 9999)))
         return f"0xMe{name_digits}"
 
-    suffix = "".join(superscript_digits[int(digit)] for digit in str(random.randint(10, 99)))
+    suffix = "".join(superscript_digits[int(digit)] for digit in str(random.randint(1, 999)))
     return f"{base_name[: max(1, 12 - len(suffix))]}{suffix}"
+
+
+def is_guest_name_taken_response(response):
+    if response is None:
+        return False
+
+    text = response.text[:500].lower()
+    taken_markers = (
+        "name already",
+        "nickname already",
+        "already exist",
+        "already taken",
+        "duplicate name",
+        "name is taken",
+        "nickname is taken",
+    )
+    return any(marker in text for marker in taken_markers)
+
+
+def response_brief(response, limit=160):
+    if response is None:
+        return "no response"
+    text = str(response.text or "").replace("\r", " ").replace("\n", " ").strip()
+    return f"HTTP {response.status_code} - {text[:limit]}"
+
+
+def encode_varint(number):
+    result = bytearray()
+    while number:
+        byte = number & 0x7F
+        number >>= 7
+        result.append(byte | (0x80 if number else 0))
+    return bytes(result or b"\x00")
+
+
+def encode_proto_field(field, value):
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, int):
+        return encode_varint((field << 3) | 0) + encode_varint(value)
+    if isinstance(value, dict):
+        data = encode_proto_payload(value)
+    else:
+        data = value.encode() if isinstance(value, str) else value
+    return encode_varint((field << 3) | 2) + encode_varint(len(data)) + data
+
+
+def encode_proto_payload(payload):
+    packet = bytearray()
+    for field in sorted(payload):
+        packet.extend(encode_proto_field(field, payload[field]))
+    return bytes(packet)
+
+
+def aes_encrypt_payload(payload):
+    cipher = AES.new(MAIN_KEY, AES.MODE_CBC, MAIN_IV)
+    return cipher.encrypt(pad(payload, AES.block_size))
+
+
+def encode_open_id(value):
+    key = [0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0]
+    return bytes(byte ^ key[index % len(key)] ^ 48 for index, byte in enumerate(value.encode()))
+
+
+def extract_guest_token_credentials(token_data):
+    data = token_data.get("data") if isinstance(token_data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    access_token = token_data.get("access_token") or data.get("access_token")
+    open_id = (
+        token_data.get("open_id")
+        or token_data.get("openId")
+        or token_data.get("openid")
+        or data.get("open_id")
+        or data.get("openId")
+        or data.get("openid")
+    )
+    return access_token, open_id
+
+
+def build_major_login_payload(open_id, access_token):
+    payload = {
+        3: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        4: "free fire",
+        5: 1,
+        7: "1.123.1",
+        8: "Android OS 9 / API-28 (PQ3B.190801.10101846/G9650ZHU2ARC6)",
+        9: "Handheld",
+        10: "Verizon",
+        11: "WIFI",
+        12: 1920,
+        13: 1080,
+        14: "280",
+        15: "ARM64 FP ASIMD AES VMH | 2865 | 4",
+        16: 3003,
+        17: "Adreno (TM) 640",
+        18: "OpenGL ES 3.1 v1.46",
+        19: "Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57",
+        20: "223.191.51.89",
+        21: "en",
+        22: open_id,
+        23: "4",
+        24: "Handheld",
+        25: {6: 55, 8: 81},
+        29: access_token,
+        30: 1,
+        41: "Verizon",
+        42: "WIFI",
+        57: "7428b253defc164018c604a1ebbfebdf",
+        60: 36235,
+        61: 31335,
+        62: 2519,
+        63: 703,
+        64: 25010,
+        65: 26628,
+        66: 32992,
+        67: 36235,
+        73: 3,
+        74: "/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/lib/arm64",
+        76: 1,
+        77: "5b892aaabd688e571f688053118a162b|/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/base.apk",
+        78: 3,
+        79: 2,
+        81: "64",
+        83: "2019118695",
+        86: "OpenGLES2",
+        87: 16383,
+        88: 4,
+        89: b"FwQVTgUPX1UaUllDDwcWCRBpWA0FUgsvA1snWlBaO1kFYg==",
+        92: 13564,
+        93: "android",
+        94: "KqsHTymw5/5GB23YGniUYN2/q47GATrq7eFeRatf0NkwLKEMQ0PK5BKEk72dPflAxUlEBir6Vtey83XqF593qsl8hwY=",
+        95: 110009,
+        97: 1,
+        98: 1,
+        99: "4",
+        100: "4",
+    }
+    return aes_encrypt_payload(encode_proto_payload(payload))
+
+
+def verify_guest_major_login(session, access_token, open_id):
+    encrypted_payload = build_major_login_payload(open_id, access_token)
+    last_error = ""
+    for login_url in MAJOR_LOGIN_URLS:
+        host = urlparse(login_url).netloc
+        try:
+            response = session.post(
+                login_url,
+                data=encrypted_payload,
+                headers={
+                    "Accept-Encoding": "gzip",
+                    "Authorization": "Bearer",
+                    "Connection": "Keep-Alive",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(encrypted_payload)),
+                    "Expect": "100-continue",
+                    "Host": host,
+                    "ReleaseVersion": RELEASE_VERSION,
+                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
+                    "X-GA": "v1 1",
+                    "X-Unity-Version": "2018.4.11f1",
+                },
+                timeout=20,
+            )
+            if response.status_code == 200 and response.content:
+                return True, ""
+            last_error = response_brief(response)
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+    return False, last_error or "no response"
 
 
 def register_guest_account(region, base_name=""):
     secret = b"2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
     client_id = "100067"
     user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
+    major_user_agent = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
     session = requests.Session()
-
-    def encode_open_id(value):
-        key = [0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0, 1, 7, 0, 0, 0, 0, 0, 2, 0]
-        return bytes(byte ^ key[index % len(key)] ^ 48 for index, byte in enumerate(value.encode()))
-
-    def aes_encrypt_hex(hex_value):
-        cipher = AES.new(b"Yg&tc%DEuh6%Zc^8", AES.MODE_CBC, b"6oyZDr22E3ychjM%")
-        return cipher.encrypt(pad(bytes.fromhex(hex_value), 16)).hex()
-
-    def encode_varint(number):
-        result = bytearray()
-        while number:
-            byte = number & 0x7F
-            number >>= 7
-            result.append(byte | (0x80 if number else 0))
-        return bytes(result)
-
-    def encode_field(field, value):
-        if isinstance(value, int):
-            return encode_varint((field << 3) | 0) + encode_varint(value)
-        data = value.encode() if isinstance(value, str) else value
-        return encode_varint((field << 3) | 2) + encode_varint(len(data)) + data
-
-    def encode_payload(payload):
-        packet = bytearray()
-        for field in sorted(payload):
-            packet.extend(encode_field(field, payload[field]))
-        return packet
 
     try:
         password = str(random.randint(1000000000, 9999999999))
@@ -837,13 +1002,13 @@ def register_guest_account(region, base_name=""):
         }
 
         response = session.post(
-            "https://100067.connect.garena.com/api/v2/oauth/guest:register",
+            GUEST_REGISTER_URL,
             data=body,
             headers=headers,
             timeout=15,
         )
         if response.status_code != 200:
-            return None, None, None, f"Guest register failed: HTTP {response.status_code} - {response.text[:120]}"
+            return None, None, None, f"Guest register failed: {response_brief(response)}"
 
         register_data = response.json()
         uid = (register_data.get("data") or {}).get("uid") or register_data.get("uid")
@@ -858,62 +1023,139 @@ def register_guest_account(region, base_name=""):
             "client_secret": secret.decode(),
             "client_id": client_id,
         }
-        response = session.post(
-            "https://100067.connect.garena.com/oauth/guest/token/grant",
-            data=token_body,
-            headers={"Host": "100067.connect.garena.com", "User-Agent": user_agent},
-            timeout=15,
-        )
-        if response.status_code != 200:
-            return None, None, None, f"Token grant failed: HTTP {response.status_code} - {response.text[:120]}"
+        response = None
+        last_token_error = ""
+        for token_url in GUEST_TOKEN_GRANT_URLS:
+            token_host = urlparse(token_url).netloc
+            try:
+                if "/api/v2/" in token_url:
+                    token_json = json.dumps(
+                        {
+                            "uid": str(uid),
+                            "password": password_hash,
+                            "response_type": "token",
+                            "client_type": 2,
+                            "client_secret": secret.decode(),
+                            "client_id": int(client_id),
+                        },
+                        separators=(",", ":"),
+                    )
+                    response = session.post(
+                        token_url,
+                        data=token_json,
+                        headers={
+                            "Host": token_host,
+                            "User-Agent": user_agent,
+                            "Authorization": f"Signature {hmac.new(secret, token_json.encode(), hashlib.sha256).hexdigest()}",
+                            "Content-Type": "application/json; charset=utf-8",
+                            "Accept": "application/json",
+                            "Connection": "Keep-Alive",
+                            "Accept-Encoding": "gzip",
+                        },
+                        timeout=15,
+                    )
+                else:
+                    response = session.post(
+                        token_url,
+                        data=token_body,
+                        headers={
+                            "Host": token_host,
+                            "User-Agent": user_agent,
+                            "Connection": "Keep-Alive",
+                            "Accept-Encoding": "gzip",
+                        },
+                        timeout=15,
+                    )
+                if response.status_code == 200:
+                    break
+                last_token_error = response_brief(response)
+            except requests.exceptions.RequestException as e:
+                last_token_error = str(e)
+
+        if response is None or response.status_code != 200:
+            return None, None, None, f"Token grant failed: {last_token_error or response_brief(response)}"
 
         token_data = response.json()
-        access_token = token_data.get("access_token")
-        open_id = token_data.get("open_id") or token_data.get("openId") or token_data.get("openid")
+        access_token, open_id = extract_guest_token_credentials(token_data)
         if not access_token or not open_id:
             return None, None, None, "Token grant did not return access token/open_id."
 
-        guest_name = build_guest_name(base_name)
-        payload = {
-            1: guest_name,
-            2: access_token,
-            3: open_id,
-            5: 102000007,
-            6: 4,
-            7: 1,
-            13: 1,
-            14: encode_open_id(open_id),
-            15: region,
-            16: 1,
-        }
-        encrypted_data = bytes.fromhex(aes_encrypt_hex(encode_payload(payload).hex()))
         major_headers = {
             "Authorization": f"Bearer {access_token}",
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
-            "ReleaseVersion": "OB53",
+            "ReleaseVersion": RELEASE_VERSION,
             "Content-Type": "application/octet-stream",
-            "Content-Length": str(len(encrypted_data)),
-            "User-Agent": user_agent,
-            "Host": "loginbp.ggblueshark.com",
+            "User-Agent": major_user_agent,
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
+            "Expect": "100-continue",
         }
-        response = None
-        for attempt in range(3):
-            response = session.post(
-                "https://loginbp.ggblueshark.com/MajorRegister",
-                data=encrypted_data,
-                headers=major_headers,
-                timeout=15,
-            )
-            if response.status_code != 503:
-                break
-            time.sleep(2 * (attempt + 1))
 
-        if response.status_code == 200:
+        tried_guest_names = set()
+        guest_name = None
+        response = None
+        last_major_error = ""
+        for name_attempt in range(20):
+            for _ in range(10):
+                guest_name = build_guest_name(base_name)
+                if guest_name not in tried_guest_names:
+                    tried_guest_names.add(guest_name)
+                    break
+
+            payload = {
+                1: guest_name,
+                2: access_token,
+                3: open_id,
+                5: 102000007,
+                6: 4,
+                7: 1,
+                13: 1,
+                14: encode_open_id(open_id),
+                15: region,
+                16: 1,
+                17: 1,
+            }
+            encrypted_data = aes_encrypt_payload(encode_proto_payload(payload))
+            major_headers["Content-Length"] = str(len(encrypted_data))
+
+            for major_url in MAJOR_REGISTER_URLS:
+                major_headers["Host"] = urlparse(major_url).netloc
+                for auth_value in (f"Bearer {access_token}", "Bearer"):
+                    major_headers["Authorization"] = auth_value
+                    for attempt in range(3):
+                        try:
+                            response = session.post(
+                                major_url,
+                                data=encrypted_data,
+                                headers=major_headers,
+                                timeout=15,
+                            )
+                        except requests.exceptions.RequestException as e:
+                            last_major_error = str(e)
+                            response = None
+                            break
+
+                        if response.status_code not in {500, 502, 503, 504}:
+                            break
+                        last_major_error = response_brief(response)
+                        time.sleep(2 * (attempt + 1))
+
+                    if response is not None and (response.status_code == 200 or is_guest_name_taken_response(response)):
+                        break
+
+                if response is not None and (response.status_code == 200 or is_guest_name_taken_response(response)):
+                    break
+
+            if response is not None and (response.status_code == 200 or not is_guest_name_taken_response(response)):
+                break
+
+        if response is not None and response.status_code == 200:
+            login_ok, login_error = verify_guest_major_login(session, access_token, open_id)
+            if not login_ok:
+                return str(uid), password_hash, guest_name, f"MajorLogin check failed: {login_error}"
             return str(uid), password_hash, guest_name, None
-        return str(uid), password_hash, guest_name, f"Major register failed: HTTP {response.status_code} - {response.text[:120]}"
+        return str(uid), password_hash, guest_name, f"Major register failed: {response_brief(response) if response is not None else last_major_error or 'no response'}"
     except requests.exceptions.Timeout:
         return None, None, None, "Guest generation timed out."
     except requests.exceptions.RequestException as e:
@@ -1022,6 +1264,16 @@ def format_jwt_check_result(uid, data, attempts):
         "🎟 JWT Token\n"
         f"{token}"
     )
+
+
+def extract_jwt_account_id(data):
+    if not isinstance(data, dict):
+        return ""
+    for key in ("account_id", "accountId", "account_uid", "accountUid", "uid"):
+        value = str(data.get(key, "")).strip()
+        if value and value.lower() != "none":
+            return value
+    return ""
 
 
 def refresh_single_uidpass(uid, password):
@@ -1516,7 +1768,7 @@ def handle_bio(message):
         bot.reply_to(message, text)
 
 
-@bot.message_handler(commands=["guestgen"])
+@bot.message_handler(commands=["guestgen", "geustgen"])
 def handle_guestgen(message):
     if message.from_user.id != OWNER_ID:
         bot.reply_to(message, "This command is owner only.")
@@ -1529,7 +1781,7 @@ def handle_guestgen(message):
 
     region = args[1].strip().upper()
     if region not in GUESTGEN_REGIONS:
-        bot.reply_to(message, f"{GUESTGEN_USAGE}\n\nInvalid region. Use one of: {', '.join(sorted(GUESTGEN_REGIONS))}")
+        bot.reply_to(message, f"{GUESTGEN_USAGE}\n\nInvalid region. Use one of: {', '.join(GUESTGEN_REGIONS)}")
         return
 
     base_name = " ".join(args[2:]).strip()
@@ -1539,25 +1791,40 @@ def handle_guestgen(message):
 def process_guestgen(message, region, base_name=""):
     processing_msg = bot.reply_to(message, f"Please wait... Generating guest account for {region}.")
     uid, password, guest_name, error = register_guest_account(region, base_name)
+    account_id = ""
+    jwt_error = ""
+
+    if uid and password:
+        jwt_data, jwt_error, _ = check_jwt(uid, password)
+        account_id = extract_jwt_account_id(jwt_data)
 
     if uid and password and error:
+        warning_lines = [error]
+        if not account_id:
+            warning_lines.append(f"JWT account check failed: {jwt_error or 'account_id missing'}")
         text = (
             "Guest account generated\n\n"
             f"Region: {region}\n"
             f"Name: {guest_name}\n"
+            f"Account ID: {account_id or 'N/A'}\n"
             f"UID: {uid}\n"
             f"Password: {password}\n\n"
-            f"Warning: {error}"
+            f"Warning: {'; '.join(warning_lines)}"
         )
     elif error:
         text = f"Guest generation failed\n\nRegion: {region}\nReason: {error}"
     else:
+        warning_text = ""
+        if not account_id:
+            warning_text = f"\n\nWarning: JWT account check failed: {jwt_error or 'account_id missing'}"
         text = (
             "Guest account generated\n\n"
             f"Region: {region}\n"
             f"Name: {guest_name}\n"
+            f"Account ID: {account_id or 'N/A'}\n"
             f"UID: {uid}\n"
             f"Password: {password}"
+            f"{warning_text}"
         )
 
     try:
@@ -1744,7 +2011,7 @@ def help_command(message):
             "/checkjwt <uid> <password> - Check JWT API with retry\n"
             "/adduidpass <uid> <password> - Add UID/PASS and fetch only its token\n\n"
             "/updateuidpass <uid> <new_password> - Update password after token check\n"
-            "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
+            "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name (/geustgen also works)\n\n"
             f"Support: {OWNER_USERNAME}"
         )
         bot.reply_to(message, help_text)
@@ -1786,6 +2053,7 @@ def reply_all(message):
         "/updateuidpass",
         "/addremain",
         "/guestgen",
+        "/geustgen",
     }
     command = message.text.split()[0].split("@")[0].lower()
     if command not in known_commands:
