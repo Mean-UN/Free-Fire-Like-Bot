@@ -132,6 +132,11 @@ GUESTGEN_POOL_SIZE = int(os.getenv("GUESTGEN_POOL_SIZE", "10"))
 GUESTGEN_ACCOUNT_ATTEMPTS = int(os.getenv("GUESTGEN_ACCOUNT_ATTEMPTS", "3"))
 GUESTGEN_PROXY_ROTATION_ENABLED = os.getenv("GUESTGEN_PROXY_ROTATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GUESTGEN_PROXY_ROTATE_EVERY = max(1, int(os.getenv("GUESTGEN_PROXY_ROTATE_EVERY", "1")))
+GUESTGEN_DIRECT_REGIONS = {
+    item.strip().upper()
+    for item in os.getenv("GUESTGEN_DIRECT_REGIONS", "SG").split(",")
+    if item.strip()
+}
 GUESTGEN_TOR_PROXY_URL = os.getenv("GUESTGEN_TOR_PROXY_URL", "socks5h://127.0.0.1:9050").strip()
 GUESTGEN_TOR_CONTROL_HOST = os.getenv("GUESTGEN_TOR_CONTROL_HOST", "127.0.0.1").strip()
 GUESTGEN_TOR_CONTROL_PORT = int(os.getenv("GUESTGEN_TOR_CONTROL_PORT", "9051"))
@@ -1254,8 +1259,10 @@ def is_socks_proxy_error(error):
     return "socks" in text or "proxy" in text or "127.0.0.1:9050" in text
 
 
-def get_guestgen_proxy():
+def get_guestgen_proxy(region=""):
     global guestgen_proxy_use_count
+    if str(region or "").upper() in GUESTGEN_DIRECT_REGIONS:
+        return ""
     if not GUESTGEN_PROXY_ROTATION_ENABLED or not GUESTGEN_TOR_PROXY_URL:
         return ""
     if time.time() < guestgen_proxy_disabled_until:
@@ -1490,7 +1497,7 @@ def register_guest_account(region, base_name=""):
     client_id = "100067"
     user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
     major_user_agent = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
-    proxy_url = get_guestgen_proxy()
+    proxy_url = get_guestgen_proxy(region)
     proxy_label = redact_proxy_url(proxy_url)
     session = configure_guestgen_session(requests.Session(), proxy_url=proxy_url)
 
