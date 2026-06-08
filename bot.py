@@ -21,6 +21,11 @@ from telebot.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMa
 from urllib3.util.retry import Retry
 
 try:
+    import MajorLoginReq_pb2
+except Exception:
+    MajorLoginReq_pb2 = None
+
+try:
     import MajorLoginRes_pb2
 except Exception:
     MajorLoginRes_pb2 = None
@@ -1375,6 +1380,69 @@ def extract_guest_token_credentials(token_data):
 def build_major_login_payload(open_id, access_token, platform=None, language="en"):
     platform = str(platform or "4")
     language = str(language or "en")
+    if MajorLoginReq_pb2 is not None:
+        try:
+            message = MajorLoginReq_pb2.MajorLogin(
+                event_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                game_name="free fire",
+                platform_id=1,
+                client_version="1.123.1",
+                system_software="Android OS 9 / API-28 (PQ3B.190801.10101846/G9650ZHU2ARC6)",
+                system_hardware="Handheld",
+                telecom_operator="Verizon",
+                network_type="WIFI",
+                screen_width=1920,
+                screen_height=1080,
+                screen_dpi="280",
+                processor_details="ARM64 FP ASIMD AES VMH | 2865 | 4",
+                memory=3003,
+                gpu_renderer="Adreno (TM) 640",
+                gpu_version="OpenGL ES 3.1 v1.46",
+                unique_device_id="Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57",
+                client_ip="223.191.51.89",
+                language=language,
+                open_id=open_id,
+                open_id_type="4",
+                device_type="Handheld",
+                memory_available=MajorLoginReq_pb2.GameSecurity(version=55, hidden_value=81),
+                access_token=access_token,
+                platform_sdk_id=1,
+                network_operator_a="Verizon",
+                network_type_a="WIFI",
+                client_using_version="7428b253defc164018c604a1ebbfebdf",
+                external_storage_total=36235,
+                external_storage_available=31335,
+                internal_storage_total=2519,
+                internal_storage_available=703,
+                game_disk_storage_available=25010,
+                game_disk_storage_total=26628,
+                external_sdcard_avail_storage=32992,
+                external_sdcard_total_storage=36235,
+                login_by=3,
+                library_path="/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/lib/arm64",
+                reg_avatar=1,
+                library_token="5b892aaabd688e571f688053118a162b|/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/base.apk",
+                channel_type=3,
+                cpu_type=2,
+                cpu_architecture="64",
+                client_version_code="2019118695",
+                graphics_api="OpenGLES2",
+                supported_astc_bitset=16383,
+                login_open_id_type=4,
+                analytics_detail=b"FwQVTgUPX1UaUllDDwcWCRBpWA0FUgsvA1snWlBaO1kFYg==",
+                loading_time=13564,
+                release_channel="android",
+                extra_info="KqsHTymw5/5GB23YGniUYN2/q47GATrq7eFeRatf0NkwLKEMQ0PK5BKEk72dPflAxUlEBir6Vtey83XqF593qsl8hwY=",
+                android_engine_init_flag=110009,
+                if_push=1,
+                is_vpn=1,
+                origin_platform_type=platform,
+                primary_platform_type=platform,
+            )
+            return aes_encrypt_payload(message.SerializeToString())
+        except Exception as e:
+            logger.info(f"MajorLoginReq protobuf encode failed, using fallback encoder: {e}")
+
     payload = {
         3: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         4: "free fire",
