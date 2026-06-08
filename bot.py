@@ -159,23 +159,258 @@ def extract_access_token(raw):
     return None
 
 
-def call_bio_api(access_token, bio_text):
+def parse_protobuf_scalars(data):
+    result = {}
+    index = 0
+
+    def read_varint(offset):
+        value = 0
+        shift = 0
+        while offset < len(data):
+            byte = data[offset]
+            offset += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value, offset
+            shift += 7
+        raise ValueError("Truncated varint")
+
+    while index < len(data):
+        key, index = read_varint(index)
+        field = key >> 3
+        wire_type = key & 7
+        if wire_type == 0:
+            value, index = read_varint(index)
+        elif wire_type == 2:
+            length, index = read_varint(index)
+            value = data[index:index + length]
+            index += length
+        elif wire_type == 5:
+            value = data[index:index + 4]
+            index += 4
+        elif wire_type == 1:
+            value = data[index:index + 8]
+            index += 8
+        else:
+            raise ValueError(f"Unsupported wire type {wire_type}")
+        result.setdefault(field, []).append(value)
+    return result
+
+
+def decode_major_login_info(raw_bytes):
+    fields = parse_protobuf_scalars(raw_bytes)
+
+    def text_field(field):
+        values = fields.get(field) or []
+        if not values:
+            return ""
+        value = values[-1]
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="ignore")
+        return str(value)
+
+    def int_field(field):
+        values = fields.get(field) or []
+        if not values:
+            return 0
+        value = values[-1]
+        return value if isinstance(value, int) else 0
+
+    return {
+        "account_id": str(int_field(1) or ""),
+        "region": text_field(2),
+        "token": text_field(8),
+        "server_url": text_field(10),
+        "timestamp": int_field(21),
+        "key": (fields.get(22) or [b""])[-1],
+        "iv": (fields.get(23) or [b""])[-1],
+    }
+
+
+def get_open_id_from_access_token(access_token):
+    response = requests.get(
+        "https://100067.connect.garena.com/oauth/token/inspect",
+        params={"token": access_token},
+        headers={
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "close",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": "100067.connect.garena.com",
+            "User-Agent": "GarenaMSDK/4.0.19P4(G011A ;Android 9;en;US;)",
+        },
+        timeout=10,
+    )
     try:
-        url = f"{BIO_API_BASE_URL}?access_token={access_token}&bio={quote(bio_text, safe='')}"
-        if BIO_API_KEY:
-            url += f"&key={quote(BIO_API_KEY, safe='')}"
-        response = requests.get(url, timeout=20)
+        data = response.json()
+    except ValueError:
+        return "", "", f"Token inspect returned invalid JSON: {response_brief(response)}"
+
+    if response.status_code != 200 or data.get("error"):
+        return "", "", data.get("error") or response_brief(response)
+
+    open_id = data.get("open_id") or data.get("openId") or data.get("openid")
+    platform = data.get("platform")
+    if not open_id:
+        return "", "", "Token inspect did not return open_id."
+    return str(open_id), str(platform or "4"), ""
+
+
+def get_bio_jwt(access_token):
+    open_id, platform, error = get_open_id_from_access_token(access_token)
+    if error:
+        return None, error
+
+    encrypted_payload = build_major_login_payload(open_id, access_token, platform=platform)
+    last_error = ""
+    for login_url in MAJOR_LOGIN_URLS:
+        host = urlparse(login_url).netloc
         try:
-            return response.json()
-        except ValueError:
-            return {"status": "error", "message": "Invalid response from bio service."}
+            response = requests.post(
+                login_url,
+                data=encrypted_payload,
+                headers={
+                    "Accept-Encoding": "gzip",
+                    "Authorization": "Bearer",
+                    "Connection": "Keep-Alive",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(encrypted_payload)),
+                    "Expect": "100-continue",
+                    "Host": host,
+                    "ReleaseVersion": RELEASE_VERSION,
+                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)",
+                    "X-GA": "v1 1",
+                    "X-Unity-Version": "2018.4.11f1",
+                },
+                timeout=15,
+            )
+            if response.status_code == 200 and response.content:
+                info = decode_major_login_info(response.content)
+                if info.get("token"):
+                    return info, ""
+                last_error = "MajorLogin response did not contain JWT token."
+            else:
+                last_error = response_brief(response)
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+        except Exception as e:
+            last_error = f"MajorLogin decode failed: {e}"
+
+    return None, last_error or "MajorLogin failed."
+
+
+def update_bio_with_jwt(jwt_token, bio_text, server_url=""):
+    payload = {
+        2: 17,
+        5: b"",
+        6: b"",
+        8: bio_text,
+        9: 1,
+        11: b"",
+        12: b"",
+    }
+    encrypted_data = aes_encrypt_payload(encode_proto_payload(payload))
+    urls = []
+    if server_url:
+        urls.append(f"{server_url.rstrip('/')}/UpdateSocialBasicInfo")
+    urls.extend(
+        [
+            "https://clientbp.ggpolarbear.com/UpdateSocialBasicInfo",
+            "https://clientbp.ggblueshark.com/UpdateSocialBasicInfo",
+            "https://client.ind.freefiremobile.com/UpdateSocialBasicInfo",
+            "https://client.us.freefiremobile.com/UpdateSocialBasicInfo",
+        ]
+    )
+
+    last_error = ""
+    tried = set()
+    for url in urls:
+        if url in tried:
+            continue
+        tried.add(url)
+        host = urlparse(url).netloc
+        try:
+            response = requests.post(
+                url,
+                data=encrypted_data,
+                headers={
+                    "Expect": "100-continue",
+                    "Authorization": f"Bearer {jwt_token}",
+                    "X-Unity-Version": "2018.4.11f1",
+                    "X-GA": "v1 1",
+                    "ReleaseVersion": RELEASE_VERSION,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(encrypted_data)),
+                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
+                    "Host": host,
+                    "Connection": "Keep-Alive",
+                    "Accept-Encoding": "gzip",
+                },
+                timeout=15,
+            )
+            if response.status_code == 200:
+                return True, ""
+            last_error = response_brief(response)
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+
+    return False, last_error or "No update response."
+
+
+def call_bio_api(access_token, bio_text):
+    if len(bio_text) >= 250:
+        return {"status": "error", "message": "BIO must be less than 250 characters."}
+
+    try:
+        login_info, error = get_bio_jwt(access_token)
+        if error:
+            return {"status": "error", "message": error}
+
+        ok, error = update_bio_with_jwt(login_info["token"], bio_text, login_info.get("server_url", ""))
+        if not ok:
+            return {"status": "error", "message": error}
+
+        uid = login_info.get("account_id") or "N/A"
+        region = login_info.get("region") or "N/A"
+        nickname = fetch_bio_player_name(uid, region)
+
+        return {
+            "status": "success",
+            "uid": uid,
+            "nickname": nickname or "N/A",
+            "region": region,
+            "bio": bio_text,
+        }
     except requests.exceptions.Timeout:
-        return {"status": "error", "message": "Bio service timed out. Please try again."}
+        return {"status": "error", "message": "Bio update timed out. Please try again."}
     except requests.exceptions.ConnectionError:
-        return {"status": "error", "message": "Could not connect to bio service."}
+        return {"status": "error", "message": "Could not connect to Free Fire bio server."}
     except Exception as e:
-        logger.error(f"Bio API failed: {e}", exc_info=True)
-        return {"status": "error", "message": "Bio service failed. Please try again later."}
+        logger.error(f"Bio update failed: {e}", exc_info=True)
+        return {"status": "error", "message": "Bio update failed. Check bot logs."}
+
+
+def fetch_bio_player_name(uid, region):
+    if not uid or uid == "N/A":
+        return ""
+
+    responses = []
+    response = call_ffinfo_api(region if region != "N/A" else "", uid)
+    responses.append(response)
+    if "error" in response:
+        responses.append(call_direct_ffinfo_api(region if region != "N/A" else "", uid))
+
+    for item in responses:
+        if not isinstance(item, dict) or "error" in item:
+            continue
+        data = item.get("data") if isinstance(item.get("data"), dict) else item
+        basic = pick(data, "basicInfo", "AccountInfo", default={})
+        nickname = pick(basic, "nickname", "AccountName", "PlayerNickname", default="")
+        if nickname and nickname != "N/A":
+            return str(nickname).strip()
+        nickname = pick(data, "nickname", "AccountName", "PlayerNickname", default="")
+        if nickname and nickname != "N/A":
+            return str(nickname).strip()
+    return ""
 
 
 def call_api(region, uid):
@@ -886,7 +1121,8 @@ def extract_guest_token_credentials(token_data):
     return access_token, open_id
 
 
-def build_major_login_payload(open_id, access_token):
+def build_major_login_payload(open_id, access_token, platform=None):
+    platform = str(platform or "4")
     payload = {
         3: datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         4: "free fire",
@@ -941,8 +1177,8 @@ def build_major_login_payload(open_id, access_token):
         95: 110009,
         97: 1,
         98: 1,
-        99: "4",
-        100: "4",
+        99: platform,
+        100: platform,
     }
     return aes_encrypt_payload(encode_proto_payload(payload))
 
@@ -1708,15 +1944,20 @@ def process_like(message, region, uid):
 @bot.message_handler(commands=["bio"])
 def handle_bio(message):
     user_id = message.from_user.id
+    chat_id = message.chat.id
+    try:
+        bot.delete_message(chat_id, message.message_id)
+    except Exception as e:
+        logger.info(f"Could not delete /bio command message: {e}")
 
     if not is_user_in_channel(user_id):
-        bot.reply_to(message, "You must join all our channels to use this command.", reply_markup=build_join_markup())
+        bot.send_message(chat_id, "You must join all our channels to use this command.", reply_markup=build_join_markup())
         return
 
     parts = message.text.strip().split(None, 2)
     if len(parts) < 3:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            chat_id,
             "Format: /bio <access_token_or_link> <new bio>\n\n"
             "Accepted token formats:\n"
             "- Plain lowercase token\n"
@@ -1729,31 +1970,29 @@ def handle_bio(message):
     bio_text = parts[2].strip()
 
     if token is None:
-        bot.reply_to(
-            message,
+        bot.send_message(
+            chat_id,
             "Invalid access token format.\n\n"
             "Send a plain lowercase token, a Kiosgamer link, or a Garena Help access_token link.",
         )
         return
 
     if not bio_text:
-        bot.reply_to(message, "Bio text cannot be empty.")
+        bot.send_message(chat_id, "Bio text cannot be empty.")
         return
 
-    processing_msg = bot.reply_to(message, "Please wait... Updating bio.")
+    processing_msg = bot.send_message(chat_id, "Please wait... Updating bio.")
     result = call_bio_api(token, bio_text)
 
     if str(result.get("status", "")).lower() == "success":
         nickname = result.get("nickname", "Unknown")
         uid = result.get("uid", "N/A")
-        platform = result.get("platform", "N/A")
         region = result.get("region", "N/A")
         new_bio = result.get("bio", bio_text)
         text = (
             "✅ Bio updated successfully\n\n"
             f"👤 Player: {nickname}\n"
             f"🆔 UID: {uid}\n"
-            f"📱 Platform: {platform}\n"
             f"🌐 Region: {region}\n\n"
             f"📝 New Bio: {new_bio}\n\n"
             f"Support: {OWNER_USERNAME}"
@@ -1765,10 +2004,10 @@ def handle_bio(message):
     try:
         bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
     except Exception:
-        bot.reply_to(message, text)
+        bot.send_message(chat_id, text)
 
 
-@bot.message_handler(commands=["guestgen", "geustgen"])
+@bot.message_handler(commands=["guestgen"])
 def handle_guestgen(message):
     if message.from_user.id != OWNER_ID:
         bot.reply_to(message, "This command is owner only.")
@@ -2011,7 +2250,7 @@ def help_command(message):
             "/checkjwt <uid> <password> - Check JWT API with retry\n"
             "/adduidpass <uid> <password> - Add UID/PASS and fetch only its token\n\n"
             "/updateuidpass <uid> <new_password> - Update password after token check\n"
-            "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name (/geustgen also works)\n\n"
+            "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
             f"Support: {OWNER_USERNAME}"
         )
         bot.reply_to(message, help_text)
@@ -2053,7 +2292,6 @@ def reply_all(message):
         "/updateuidpass",
         "/addremain",
         "/guestgen",
-        "/geustgen",
     }
     command = message.text.split()[0].split("@")[0].lower()
     if command not in known_commands:
