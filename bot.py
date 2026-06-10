@@ -135,18 +135,7 @@ COMMON_MAJOR_LOGIN_REGIONS = {"IND", "ME", "TH", "TW", "CIS", "SAC"}
 GUESTGEN_HTTP_RETRIES = int(os.getenv("GUESTGEN_HTTP_RETRIES", "2"))
 GUESTGEN_POOL_SIZE = int(os.getenv("GUESTGEN_POOL_SIZE", "10"))
 GUESTGEN_ACCOUNT_ATTEMPTS = int(os.getenv("GUESTGEN_ACCOUNT_ATTEMPTS", "3"))
-GUESTGEN_PROXY_ROTATION_ENABLED = os.getenv("GUESTGEN_PROXY_ROTATION_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-GUESTGEN_PROXY_ROTATE_EVERY = max(1, int(os.getenv("GUESTGEN_PROXY_ROTATE_EVERY", "1")))
-GUESTGEN_DIRECT_REGIONS = {
-    item.strip().upper()
-    for item in os.getenv("GUESTGEN_DIRECT_REGIONS", "SG").split(",")
-    if item.strip()
-}
-GUESTGEN_TOR_PROXY_URL = os.getenv("GUESTGEN_TOR_PROXY_URL", "socks5h://127.0.0.1:9050").strip()
-GUESTGEN_TOR_CONTROL_HOST = os.getenv("GUESTGEN_TOR_CONTROL_HOST", "127.0.0.1").strip()
-GUESTGEN_TOR_CONTROL_PORT = int(os.getenv("GUESTGEN_TOR_CONTROL_PORT", "9051"))
-GUESTGEN_TOR_CONTROL_PASSWORD = os.getenv("GUESTGEN_TOR_CONTROL_PASSWORD", "")
-GUESTGEN_TOR_RENEW_WAIT_SECONDS = float(os.getenv("GUESTGEN_TOR_RENEW_WAIT_SECONDS", "3"))
+GUESTGEN_REQUIRE_REGION_MATCH = os.getenv("GUESTGEN_REQUIRE_REGION_MATCH", "true").strip().lower() in {"1", "true", "yes", "on"}
 GUESTGEN_MAJOR_LOGIN_USER_AGENTS = (
     "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
     "Dalvik/2.1.0 (Linux; U; Android 12; ASUS_Z01QD Build/SKQ1.210216.001)",
@@ -160,9 +149,6 @@ app = Flask(__name__)
 
 # In-memory daily usage tracker
 like_tracker = {}
-guestgen_proxy_lock = threading.Lock()
-guestgen_proxy_use_count = 0
-guestgen_proxy_disabled_until = 0
 
 
 def reset_limits():
@@ -1191,6 +1177,10 @@ def short_guestgen_warning(error):
             pass
 
     lowered = text.lower()
+    if "br_guest_register_forbidden" in lowered:
+        return "BR guest register forbidden"
+    if "guest_register_forbidden" in lowered:
+        return "guest register forbidden"
     if "account_not_found" in lowered or "account not found" in lowered:
         return "account not found"
     if "missing account_id" in lowered or "did not return account_id" in lowered:
@@ -1202,96 +1192,60 @@ def short_guestgen_warning(error):
     return text[:120]
 
 
-def redact_proxy_url(proxy_url):
-    if not proxy_url:
-        return "direct"
-    parsed = urlparse(proxy_url)
-    if not parsed.hostname:
-        return "proxy"
-    host = parsed.hostname
-    port = f":{parsed.port}" if parsed.port else ""
-    return f"{parsed.scheme}://{host}{port}"
+def normalize_guestgen_region(region):
+    region = str(region or "").strip().upper()
+    aliases = {
+        "EUROPE": "EU",
+        "NA": "US",
+        "NORTH_AMERICA": "US",
+        "RUSSIA": "RU",
+    }
+    return aliases.get(region, region)
 
 
-def renew_guestgen_tor_ip():
-    try:
-        import socket
-
-        with socket.create_connection((GUESTGEN_TOR_CONTROL_HOST, GUESTGEN_TOR_CONTROL_PORT), timeout=10) as sock:
-            password = GUESTGEN_TOR_CONTROL_PASSWORD.replace('"', '\\"')
-            if password:
-                sock.sendall(f'AUTHENTICATE "{password}"\r\n'.encode())
-            else:
-                sock.sendall(b'AUTHENTICATE ""\r\n')
-            auth_response = sock.recv(1024)
-            if not auth_response.startswith(b"250"):
-                return False, f"Tor authenticate failed: {auth_response.decode(errors='ignore').strip()}"
-
-            sock.sendall(b"SIGNAL NEWNYM\r\n")
-            newnym_response = sock.recv(1024)
-            if not newnym_response.startswith(b"250"):
-                return False, f"Tor NEWNYM failed: {newnym_response.decode(errors='ignore').strip()}"
-
-            sock.sendall(b"QUIT\r\n")
-
-        time.sleep(max(0, GUESTGEN_TOR_RENEW_WAIT_SECONDS))
-        return True, "Tor NEWNYM sent"
-    except Exception as e:
-        return False, str(e)
+def guestgen_regions_match(requested_region, actual_region):
+    requested = normalize_guestgen_region(requested_region)
+    actual = normalize_guestgen_region(actual_region)
+    if not requested or not actual:
+        return True
+    if requested == actual:
+        return True
+    allowed_pairs = {
+        ("CIS", "RU"),
+        ("RU", "CIS"),
+    }
+    return (requested, actual) in allowed_pairs
 
 
-def is_guestgen_tor_proxy_ready():
-    try:
-        import socket
-
-        parsed = urlparse(GUESTGEN_TOR_PROXY_URL)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or 9050
-        with socket.create_connection((host, port), timeout=1.5):
-            return True
-    except Exception:
-        return False
+def guestgen_register_forbidden_message(region, warning):
+    region = str(region or "").strip().upper()
+    if warning == "BR guest register forbidden":
+        if region == "BR":
+            return "BR guest register forbidden. Use SAC instead."
+        return f"{region} guest register forbidden on current server route."
+    if warning == "guest register forbidden":
+        return f"{region} guest register forbidden on current server route."
+    return ""
 
 
-def disable_guestgen_proxy_temporarily(reason, seconds=60):
-    global guestgen_proxy_disabled_until
-    guestgen_proxy_disabled_until = time.time() + max(1, seconds)
-    logger.warning(f"/guestgen proxy disabled temporarily, using direct network: {reason}")
-
-
-def is_socks_proxy_error(error):
-    text = str(error).lower()
-    return "socks" in text or "proxy" in text or "127.0.0.1:9050" in text
-
-
-def get_guestgen_proxy(region=""):
-    global guestgen_proxy_use_count
-    if str(region or "").upper() in GUESTGEN_DIRECT_REGIONS:
-        return ""
-    if not GUESTGEN_PROXY_ROTATION_ENABLED or not GUESTGEN_TOR_PROXY_URL:
-        return ""
-    if time.time() < guestgen_proxy_disabled_until:
-        return ""
-    if not is_guestgen_tor_proxy_ready():
-        disable_guestgen_proxy_temporarily("Tor SOCKS port is not reachable")
-        return ""
-
-    with guestgen_proxy_lock:
-        guestgen_proxy_use_count += 1
-        if guestgen_proxy_use_count >= GUESTGEN_PROXY_ROTATE_EVERY:
-            guestgen_proxy_use_count = 0
-            ok, detail = renew_guestgen_tor_ip()
-            if ok:
-                logger.info(f"/guestgen Tor rotation: {detail}")
-            else:
-                logger.warning(f"/guestgen Tor rotation failed: {detail}")
-        return GUESTGEN_TOR_PROXY_URL
+def extract_guestgen_login_region(login_info, fallback_region=""):
+    login_info = login_info or {}
+    return str(
+        login_info.get("lock_region")
+        or login_info.get("region")
+        or login_info.get("new_active_region")
+        or fallback_region
+        or ""
+    ).strip().upper()
 
 
 def ordered_major_register_urls(region):
+    urls = []
     if str(region or "").upper() in COMMON_MAJOR_REGISTER_REGIONS:
-        return (COMMON_MAJOR_REGISTER_URL, *MAJOR_REGISTER_URLS)
-    return MAJOR_REGISTER_URLS
+        urls.append(COMMON_MAJOR_REGISTER_URL)
+    urls.extend(MAJOR_REGISTER_URLS)
+    urls.append(COMMON_MAJOR_REGISTER_URL)
+    return tuple(dict.fromkeys(urls))
 
 
 def ordered_major_login_urls(region=None):
@@ -1300,7 +1254,7 @@ def ordered_major_login_urls(region=None):
     return MAJOR_LOGIN_URLS
 
 
-def configure_guestgen_session(session, proxy_url=""):
+def configure_guestgen_session(session):
     retry = Retry(
         total=GUESTGEN_HTTP_RETRIES,
         connect=GUESTGEN_HTTP_RETRIES,
@@ -1318,8 +1272,6 @@ def configure_guestgen_session(session, proxy_url=""):
     )
     session.mount("https://", adapter)
     session.mount("http://", adapter)
-    if proxy_url:
-        session.proxies.update({"http": proxy_url, "https": proxy_url})
     return session
 
 
@@ -1565,13 +1517,9 @@ def register_guest_account(region, base_name=""):
     client_id = "100067"
     user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
     major_user_agent = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
-    proxy_url = get_guestgen_proxy(region)
-    proxy_label = redact_proxy_url(proxy_url)
-    session = configure_guestgen_session(requests.Session(), proxy_url=proxy_url)
+    session = configure_guestgen_session(requests.Session())
 
     try:
-        if proxy_url:
-            logger.info(f"/guestgen using proxy {proxy_label}")
         language = GUESTGEN_REGION_LANG.get(region.upper(), "en")
         password = str(random.randint(1000000000, 9999999999))
         password_hash = hashlib.sha256(password.encode()).hexdigest().upper()
@@ -1678,7 +1626,7 @@ def register_guest_account(region, base_name=""):
             "X-Unity-Version": "2018.4.11f1",
             "X-GA": "v1 1",
             "ReleaseVersion": RELEASE_VERSION,
-            "Content-Type": "application/octet-stream",
+            "Content-Type": "application/x-www-form-urlencoded",
             "User-Agent": major_user_agent,
             "Connection": "Keep-Alive",
             "Accept-Encoding": "gzip",
@@ -1712,50 +1660,84 @@ def register_guest_account(region, base_name=""):
             encrypted_data = aes_encrypt_payload(encode_proto_payload(payload))
             major_headers["Content-Length"] = str(len(encrypted_data))
 
+            name_taken = False
             for major_url in ordered_major_register_urls(region):
                 major_headers["Host"] = urlparse(major_url).netloc
-                for auth_value in (f"Bearer {access_token}", "Bearer"):
+                for auth_value in ("Bearer", f"Bearer {access_token}"):
                     major_headers["Authorization"] = auth_value
-                    for attempt in range(3):
-                        try:
-                            response = session.post(
-                                major_url,
-                                data=encrypted_data,
-                                headers=major_headers,
-                                timeout=15,
+                    for content_type in ("application/x-www-form-urlencoded", "application/octet-stream"):
+                        major_headers["Content-Type"] = content_type
+                        for attempt in range(3):
+                            try:
+                                response = session.post(
+                                    major_url,
+                                    data=encrypted_data,
+                                    headers=major_headers,
+                                    timeout=15,
+                                )
+                            except requests.exceptions.RequestException as e:
+                                last_major_error = str(e)
+                                response = None
+                                break
+
+                            if response.status_code not in {500, 502, 503, 504}:
+                                break
+                            last_major_error = response_brief(response)
+                            time.sleep(2 * (attempt + 1))
+
+                        if response is not None:
+                            last_major_error = response_brief(response)
+                            name_taken = is_guest_name_taken_response(response)
+                            logger.info(
+                                "MajorRegister %s auth=%s content_type=%s status=%s warning=%s",
+                                urlparse(major_url).netloc,
+                                "bare" if auth_value == "Bearer" else "token",
+                                content_type,
+                                response.status_code,
+                                short_guestgen_warning(last_major_error),
                             )
-                        except requests.exceptions.RequestException as e:
-                            last_major_error = str(e)
-                            response = None
+                        if response is not None and (response.status_code == 200 or name_taken):
                             break
 
-                        if response.status_code not in {500, 502, 503, 504}:
-                            break
-                        last_major_error = response_brief(response)
-                        time.sleep(2 * (attempt + 1))
-
-                    if response is not None and (response.status_code == 200 or is_guest_name_taken_response(response)):
+                    if response is not None and (response.status_code == 200 or name_taken):
                         break
 
-                if response is not None and (response.status_code == 200 or is_guest_name_taken_response(response)):
+                if response is not None and (response.status_code == 200 or name_taken):
                     break
 
-            if response is not None and (response.status_code == 200 or not is_guest_name_taken_response(response)):
+            if response is not None and response.status_code == 200:
                 break
+            if name_taken:
+                continue
+
+            warning = short_guestgen_warning(last_major_error)
+            forbidden_message = guestgen_register_forbidden_message(region, warning)
+            if forbidden_message and region.upper() == "BR":
+                return None, None, None, {}, forbidden_message
 
         if response is not None and response.status_code == 200:
             login_info, login_error = get_guest_major_login_info(session, access_token, open_id, region=region, language=language)
-            if proxy_url:
-                login_info["proxy"] = proxy_label
             if login_error:
                 return str(uid), password_hash, guest_name, login_info, f"MajorLogin check failed: {login_error}"
+            actual_region = extract_guestgen_login_region(login_info)
+            if GUESTGEN_REQUIRE_REGION_MATCH and actual_region and not guestgen_regions_match(region, actual_region):
+                return (
+                    None,
+                    None,
+                    None,
+                    {},
+                    f"Region mismatch: requested {region.upper()}, got {actual_region}. Use the matching AWS/server region.",
+                )
             return str(uid), password_hash, guest_name, login_info, None
-        return str(uid), password_hash, guest_name, {}, f"Major register failed: {response_brief(response) if response is not None else last_major_error or 'no response'}"
+        major_error = f"Major register failed: {response_brief(response) if response is not None else last_major_error or 'no response'}"
+        warning = short_guestgen_warning(major_error)
+        forbidden_message = guestgen_register_forbidden_message(region, warning)
+        if forbidden_message:
+            return None, None, None, {}, forbidden_message
+        return None, None, None, {}, major_error
     except requests.exceptions.Timeout:
         return None, None, None, {}, "Guest generation timed out."
     except requests.exceptions.RequestException as e:
-        if proxy_url and is_socks_proxy_error(e):
-            disable_guestgen_proxy_temporarily(e)
         return None, None, None, {}, f"Guest generation request failed: {e}"
     except Exception as e:
         logger.error(f"Guest generation failed: {e}", exc_info=True)
@@ -1770,6 +1752,8 @@ def register_guest_account_with_retry(region, base_name=""):
         result = register_guest_account(region, base_name)
         uid, password, guest_name, login_info, error = result
         if uid and password:
+            return result
+        if guestgen_register_forbidden_message(region, short_guestgen_warning(error)):
             return result
 
         last_result = result
@@ -2410,9 +2394,7 @@ def process_guestgen(message, region, base_name=""):
     )
     uid, password, guest_name, login_info, error = register_guest_account_with_retry(region, base_name)
     account_id = str((login_info or {}).get("account_id") or "").strip()
-    login_region = str((login_info or {}).get("lock_region") or (login_info or {}).get("region") or region).strip().upper()
-    proxy_label = str((login_info or {}).get("proxy") or "").strip()
-    proxy_line = f"Proxy: {html.escape(proxy_label)}\n" if proxy_label else ""
+    login_region = extract_guestgen_login_region(login_info, region)
     safe_region = html.escape(login_region or region)
     safe_guest_name = html.escape(str(guest_name or "N/A"))
     safe_account_id = html.escape(account_id or "N/A")
@@ -2435,13 +2417,17 @@ def process_guestgen(message, region, base_name=""):
     if uid and password and error:
         warning = short_guestgen_warning(error)
         warning_lines = [warning] if warning else []
-        if not account_id and warning != "account not found":
+        skip_account_id_warning = {
+            "account not found",
+            "BR guest register forbidden",
+            "guest register forbidden",
+        }
+        if not account_id and warning not in skip_account_id_warning:
             warning_lines.append("MajorLogin response did not return account_id")
         warning_text = html.escape("; ".join(warning_lines))
         text = (
             "Guest account generated\n\n"
             f"Region: {safe_region}\n"
-            f"{proxy_line}"
             f"Name: {safe_guest_name}\n"
             f"Account ID: <code>{safe_account_id}</code>\n"
             f"UID: <code>{safe_uid}</code>\n"
@@ -2457,7 +2443,6 @@ def process_guestgen(message, region, base_name=""):
         text = (
             "Guest account generated\n\n"
             f"Region: {safe_region}\n"
-            f"{proxy_line}"
             f"Name: {safe_guest_name}\n"
             f"Account ID: <code>{safe_account_id}</code>\n"
             f"UID: <code>{safe_uid}</code>\n"
