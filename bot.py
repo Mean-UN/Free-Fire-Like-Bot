@@ -2283,26 +2283,28 @@ def process_like(message, region, uid):
             usage["used"] += 1
             usage["last_used"] = now_utc
             like_tracker[user_id] = usage
-            title = "✅ Request processed successfully"
+            title = "REQUEST PROCESSED SUCCESSFULLY"
         else:
-            title = "UID already reached max likes for now."
+            title = "UID ALREADY REACHED MAX LIKES"
 
-        response_text = (
+        styled_text = (
             f"{title}\n\n"
-            f"👤 Name: {player_name}\n"
-            f"🆔 UID: {player_uid}\n"
-            f"🌍 Region: {region_name}\n"
-            f"❤️ Likes Before: {likes_before}\n"
-            f"➕ Likes Added: {likes_given}\n"
-            f"⭐ Total Likes Now: {likes_after}\n"
-            f"📊 Remaining Requests: {max_limit - usage['used']}\n"
-            "\n🔗 Credit: @Mean_Un"
+            f"Name               : {player_name}\n"
+            f"UID                : {player_uid}\n"
+            f"Region             : {region_name}\n"
+            f"Likes Before       : {likes_before}\n"
+            f"Likes Added        : {likes_given}\n"
+            f"Total Likes Now    : {likes_after}\n"
+            f"Remaining Requests : {max_limit - usage['used']}\n\n"
+            "Credit             : @Mean_Un"
         )
+        response_text = f"<pre>{html.escape(styled_text)}</pre>"
 
         bot.edit_message_text(
             text=response_text,
             chat_id=processing_msg.chat.id,
             message_id=processing_msg.message_id,
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error(f"Error in process_like: {e}", exc_info=True)

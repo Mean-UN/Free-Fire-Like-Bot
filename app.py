@@ -25,6 +25,8 @@ TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
 TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
 UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
+LIKE_REQUEST_CONCURRENCY = max(1, int(os.getenv("LIKE_REQUEST_CONCURRENCY", "20")))
+LIKE_REQUEST_RETRIES = max(1, int(os.getenv("LIKE_REQUEST_RETRIES", "2")))
 TOKEN_RETRY_ATTEMPTS = int(os.getenv("TOKEN_RETRY_ATTEMPTS", "10"))
 TOKEN_RETRY_DELAY_SECONDS = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "0.7"))
 FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info.killersharmabot.online/player-info").strip()
@@ -171,6 +173,22 @@ def token_region(token_item):
     token = token_item.get("token", "") if isinstance(token_item, dict) else str(token_item)
     return normalize_region(get_region_from_token(token))
 
+def token_value(token_item):
+    if isinstance(token_item, dict):
+        return str(token_item.get("token", "")).strip()
+    return str(token_item or "").strip()
+
+def unique_token_items(tokens):
+    unique = []
+    seen = set()
+    for item in tokens or []:
+        token = token_value(item)
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        unique.append(item)
+    return unique
+
 def select_tokens_for_region(tokens, server_name):
     requested_region = normalize_region(server_name)
     return [item for item in tokens if token_region(item) == requested_region]
@@ -255,7 +273,7 @@ def create_protobuf_message(user_id, region):
         app.logger.error(f"Error creating protobuf message: {e}")
         return None
 
-async def send_request(encrypted_uid, token, url):
+async def send_request(encrypted_uid, token, url, session=None):
     try:
         edata = bytes.fromhex(encrypted_uid)
         headers = {
@@ -269,17 +287,39 @@ async def send_request(encrypted_uid, token, url):
             'X-GA': "v1 1",
             'ReleaseVersion': "OB53"
         }
-        timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, data=edata, headers=headers) as response:
-                if response.status != 200:
-                    body = await response.text()
-                    app.logger.error(f"Like request failed with status {response.status}: {body[:100]}")
-                    return response.status
-                return await response.text()
+        if session is None:
+            timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as owned_session:
+                async with owned_session.post(url, data=edata, headers=headers) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        app.logger.error(f"Like request failed with status {response.status}: {body[:100]}")
+                        return response.status
+                    return await response.text()
+        async with session.post(url, data=edata, headers=headers) as response:
+            if response.status != 200:
+                body = await response.text()
+                app.logger.error(f"Like request failed with status {response.status}: {body[:100]}")
+                return response.status
+            return await response.text()
     except Exception as e:
         app.logger.error(f"Exception in send_request: {e}")
         return None
+
+async def send_request_with_retry(encrypted_uid, token_item, url, session, semaphore):
+    token = token_value(token_item)
+    uid = str(token_item.get("uid", "")) if isinstance(token_item, dict) else ""
+    async with semaphore:
+        last_result = None
+        for attempt in range(1, LIKE_REQUEST_RETRIES + 1):
+            last_result = await send_request(encrypted_uid, token, url, session=session)
+            if isinstance(last_result, str):
+                return {"uid": uid, "ok": True, "attempts": attempt}
+            if isinstance(last_result, int) and last_result < 500:
+                break
+            if attempt < LIKE_REQUEST_RETRIES:
+                await asyncio.sleep(0.25 * attempt)
+        return {"uid": uid, "ok": False, "attempts": LIKE_REQUEST_RETRIES, "result": last_result}
 
 async def send_multiple_requests(uid, server_name, url, tokens=None):
     try:
@@ -298,15 +338,33 @@ async def send_multiple_requests(uid, server_name, url, tokens=None):
         if tokens is None:
             app.logger.error("Failed to load tokens.")
             return None
-        tokens = order_tokens_for_region(tokens, server_name)
+        tokens = unique_token_items(order_tokens_for_region(tokens, server_name))
         if not tokens:
             app.logger.error("No tokens found.")
             return None
-        for i in range(100):
-            token = tokens[i % len(tokens)]["token"]
-            tasks.append(send_request(encrypted_uid, token, url))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return results
+        timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
+        connector = aiohttp.TCPConnector(limit=LIKE_REQUEST_CONCURRENCY)
+        semaphore = asyncio.Semaphore(LIKE_REQUEST_CONCURRENCY)
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            for token_item in tokens:
+                tasks.append(send_request_with_retry(encrypted_uid, token_item, url, session, semaphore))
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        normalized_results = []
+        for result in results:
+            if isinstance(result, Exception):
+                normalized_results.append({"ok": False, "attempts": LIKE_REQUEST_RETRIES, "error": str(result)})
+            else:
+                normalized_results.append(result)
+
+        succeeded = sum(1 for result in normalized_results if result.get("ok"))
+        failed = len(normalized_results) - succeeded
+        return {
+            "attempted": len(tokens),
+            "succeeded": succeeded,
+            "failed": failed,
+            "results": normalized_results,
+        }
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
         return None
@@ -473,9 +531,9 @@ def handle_requests():
             url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
         # Send like requests
-        requests_sent = asyncio.run(send_multiple_requests(uid, server_name, url, tokens=tokens))
-        app.logger.info(f"Requests sent: {requests_sent}")
-        if requests_sent is None:
+        send_report = asyncio.run(send_multiple_requests(uid, server_name, url, tokens=tokens))
+        app.logger.info(f"Like send report: {send_report}")
+        if send_report is None:
             return jsonify({"error": "Failed to send like requests."}), 500
 
         # Get after likes count
@@ -504,6 +562,9 @@ def handle_requests():
         
         return jsonify({
             "credit": "https://t.me/mean_un",
+            "GuestTokensAttempted": send_report.get("attempted", 0),
+            "GuestTokensFailed": send_report.get("failed", 0),
+            "GuestTokensSucceeded": send_report.get("succeeded", 0),
             "LikesGivenByAPI": like_given,
             "LikesafterCommand": after_like,
             "LikesbeforeCommand": before_like,
