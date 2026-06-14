@@ -3,6 +3,9 @@ import asyncio
 import os
 import threading
 import time
+import hashlib
+import hmac
+from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
@@ -13,9 +16,12 @@ import json
 import like_pb2
 import like_count_pb2
 import uid_generator_pb2
+import MajorLoginReq_pb2
+import MajorLoginRes_pb2
 from google.protobuf.message import DecodeError
 import base64
 import urllib3
+from urllib.parse import urlparse
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -23,7 +29,7 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
-TOKEN_API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
+TOKEN_API_URL = os.getenv("TOKEN_API_URL", "local").strip()
 UPSTREAM_TIMEOUT_SECONDS = int(os.getenv("UPSTREAM_TIMEOUT_SECONDS", "20"))
 TOKEN_RETRY_ATTEMPTS = int(os.getenv("TOKEN_RETRY_ATTEMPTS", "10"))
 TOKEN_RETRY_DELAY_SECONDS = float(os.getenv("TOKEN_RETRY_DELAY_SECONDS", "0.7"))
@@ -31,6 +37,28 @@ FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info.killersharmabot.onlin
 FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
+RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB53").strip() or "OB53"
+LIKE_REQUESTS_PER_CALL = max(1, int(os.getenv("LIKE_REQUESTS_PER_CALL", "100")))
+MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
+MAIN_IV = b"6oyZDr22E3ychjM%"
+GUEST_TOKEN_GRANT_URLS = (
+    "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant",
+    "https://100067.connect.garena.com/oauth/guest/token/grant",
+    "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant",
+)
+MAJOR_LOGIN_URLS = (
+    "https://loginbp.ggpolarbear.com/MajorLogin",
+    "https://loginbp.ggblueshark.com/MajorLogin",
+)
+COMMON_MAJOR_LOGIN_URL = "https://loginbp.common.ggbluefox.com/MajorLogin"
+COMMON_MAJOR_LOGIN_REGIONS = {"IND", "ME", "TH", "TW", "CIS", "SAC"}
+GUEST_CLIENT_ID = "100067"
+GUEST_CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
+GUEST_USER_AGENT = os.getenv("GUEST_USER_AGENT", "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)")
+MAJOR_LOGIN_USER_AGENT = os.getenv(
+    "MAJOR_LOGIN_USER_AGENT",
+    "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)",
+)
 FFINFO_DEFAULT_REGIONS = [
     region.strip().upper()
     for region in os.getenv("FFINFO_DEFAULT_REGIONS", "SG,IND,BD,BR,US,SAC,NA,EU,ME,TH,VN,ID,TW,RU").split(",")
@@ -47,17 +75,252 @@ def read_uidpass_records():
     with open(UIDPASS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
+def response_brief(response, limit=160):
+    if response is None:
+        return "no response"
+    try:
+        body = response.text[:limit]
+    except Exception:
+        body = ""
+    return f"HTTP {response.status_code}: {body}"
+
+
+def ordered_major_login_urls(region=None):
+    if str(region or "").upper() in COMMON_MAJOR_LOGIN_REGIONS:
+        return (COMMON_MAJOR_LOGIN_URL, *MAJOR_LOGIN_URLS)
+    return MAJOR_LOGIN_URLS
+
+
+def extract_guest_token_credentials(token_data):
+    data = token_data.get("data") if isinstance(token_data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    access_token = token_data.get("access_token") or data.get("access_token")
+    open_id = (
+        token_data.get("open_id")
+        or token_data.get("openId")
+        or token_data.get("openid")
+        or data.get("open_id")
+        or data.get("openId")
+        or data.get("openid")
+    )
+    return access_token, open_id
+
+
+def grant_guest_access_token(uid, password):
+    secret = GUEST_CLIENT_SECRET.encode()
+    session = requests.Session()
+    token_body = {
+        "uid": str(uid),
+        "password": str(password),
+        "response_type": "token",
+        "client_type": "2",
+        "client_secret": GUEST_CLIENT_SECRET,
+        "client_id": GUEST_CLIENT_ID,
+    }
+    last_error = ""
+
+    for token_url in GUEST_TOKEN_GRANT_URLS:
+        token_host = urlparse(token_url).netloc
+        try:
+            if "/api/v2/" in token_url:
+                token_json = json.dumps(
+                    {
+                        "uid": str(uid),
+                        "password": str(password),
+                        "response_type": "token",
+                        "client_type": 2,
+                        "client_secret": GUEST_CLIENT_SECRET,
+                        "client_id": int(GUEST_CLIENT_ID),
+                    },
+                    separators=(",", ":"),
+                )
+                response = session.post(
+                    token_url,
+                    data=token_json,
+                    headers={
+                        "Host": token_host,
+                        "User-Agent": GUEST_USER_AGENT,
+                        "Authorization": f"Signature {hmac.new(secret, token_json.encode(), hashlib.sha256).hexdigest()}",
+                        "Content-Type": "application/json; charset=utf-8",
+                        "Accept": "application/json",
+                        "Connection": "Keep-Alive",
+                        "Accept-Encoding": "gzip",
+                    },
+                    timeout=20,
+                )
+            else:
+                response = session.post(
+                    token_url,
+                    data=token_body,
+                    headers={
+                        "Host": token_host,
+                        "User-Agent": GUEST_USER_AGENT,
+                        "Connection": "Keep-Alive",
+                        "Accept-Encoding": "gzip",
+                    },
+                    timeout=20,
+                )
+
+            if response.status_code != 200:
+                last_error = response_brief(response)
+                continue
+            token_data = response.json()
+            access_token, open_id = extract_guest_token_credentials(token_data)
+            if access_token and open_id:
+                return str(access_token), str(open_id), token_data, ""
+            last_error = "Token grant did not return access_token/open_id."
+        except ValueError:
+            last_error = "Token grant returned invalid JSON."
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+
+    return "", "", {}, last_error or "Token grant failed."
+
+
+def aes_encrypt_payload(payload):
+    cipher = AES.new(MAIN_KEY, AES.MODE_CBC, MAIN_IV)
+    return cipher.encrypt(pad(payload, AES.block_size))
+
+
+def build_major_login_payload(open_id, access_token, platform="4", language="en"):
+    message = MajorLoginReq_pb2.MajorLogin(
+        event_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        game_name="free fire",
+        platform_id=1,
+        client_version="1.123.1",
+        system_software="Android OS 9 / API-28 (PQ3B.190801.10101846/G9650ZHU2ARC6)",
+        system_hardware="Handheld",
+        telecom_operator="Verizon",
+        network_type="WIFI",
+        screen_width=1920,
+        screen_height=1080,
+        screen_dpi="280",
+        processor_details="ARM64 FP ASIMD AES VMH | 2865 | 4",
+        memory=3003,
+        gpu_renderer="Adreno (TM) 640",
+        gpu_version="OpenGL ES 3.1 v1.46",
+        unique_device_id="Google|34a7dcdf-a7d5-4cb6-8d7e-3b0e448a0c57",
+        client_ip="223.191.51.89",
+        language=language,
+        open_id=open_id,
+        open_id_type="4",
+        device_type="Handheld",
+        memory_available=MajorLoginReq_pb2.GameSecurity(version=55, hidden_value=81),
+        access_token=access_token,
+        platform_sdk_id=1,
+        network_operator_a="Verizon",
+        network_type_a="WIFI",
+        client_using_version="7428b253defc164018c604a1ebbfebdf",
+        external_storage_total=36235,
+        external_storage_available=31335,
+        internal_storage_total=2519,
+        internal_storage_available=703,
+        game_disk_storage_available=25010,
+        game_disk_storage_total=26628,
+        external_sdcard_avail_storage=32992,
+        external_sdcard_total_storage=36235,
+        login_by=3,
+        library_path="/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/lib/arm64",
+        reg_avatar=1,
+        library_token="5b892aaabd688e571f688053118a162b|/data/app/com.dts.freefireth-YPKM8jHEwAJlhpmhDhv5MQ==/base.apk",
+        channel_type=3,
+        cpu_type=2,
+        cpu_architecture="64",
+        client_version_code="2019118695",
+        graphics_api="OpenGLES2",
+        supported_astc_bitset=16383,
+        login_open_id_type=4,
+        analytics_detail=b"FwQVTgUPX1UaUllDDwcWCRBpWA0FUgsvA1snWlBaO1kFYg==",
+        loading_time=13564,
+        release_channel="android",
+        extra_info="KqsHTymw5/5GB23YGniUYN2/q47GATrq7eFeRatf0NkwLKEMQ0PK5BKEk72dPflAxUlEBir6Vtey83XqF593qsl8hwY=",
+        android_engine_init_flag=110009,
+        if_push=1,
+        is_vpn=1,
+        origin_platform_type=str(platform or "4"),
+        primary_platform_type=str(platform or "4"),
+    )
+    return aes_encrypt_payload(message.SerializeToString())
+
+
+def decode_major_login_info(raw_bytes):
+    message = MajorLoginRes_pb2.MajorLoginRes()
+    message.ParseFromString(raw_bytes)
+    return {
+        "account_id": str(message.account_id or ""),
+        "region": message.lock_region,
+        "lock_region": message.lock_region,
+        "token": message.token,
+        "ttl": message.ttl,
+        "server_url": message.server_url,
+    }
+
+
+def create_jwt_token(uid, password, region=""):
+    access_token, open_id, token_data, error = grant_guest_access_token(uid, password)
+    if error:
+        return None, error
+
+    encrypted_payload = build_major_login_payload(open_id, access_token)
+    last_error = ""
+    for login_url in ordered_major_login_urls(region):
+        host = urlparse(login_url).netloc
+        try:
+            response = requests.post(
+                login_url,
+                data=encrypted_payload,
+                headers={
+                    "Accept-Encoding": "gzip",
+                    "Authorization": "Bearer",
+                    "Connection": "Keep-Alive",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(encrypted_payload)),
+                    "Expect": "100-continue",
+                    "Host": host,
+                    "ReleaseVersion": RELEASE_VERSION,
+                    "User-Agent": MAJOR_LOGIN_USER_AGENT,
+                    "X-GA": "v1 1",
+                    "X-Unity-Version": "2018.4.11f1",
+                },
+                timeout=20,
+            )
+            if response.status_code != 200 or not response.content:
+                last_error = response_brief(response)
+                continue
+            login_info = decode_major_login_info(response.content)
+            if login_info.get("token"):
+                login_info["access_token"] = access_token
+                login_info["open_id"] = open_id
+                login_info["token_data"] = token_data
+                return login_info, ""
+            last_error = "MajorLogin response did not contain token."
+        except requests.exceptions.RequestException as e:
+            last_error = str(e)
+        except Exception as e:
+            last_error = f"MajorLogin decode failed: {e}"
+
+    return None, last_error or "MajorLogin failed."
+
+
 def fetch_token_with_retry(uid, password):
     last_error = None
     for attempt in range(1, TOKEN_RETRY_ATTEMPTS + 1):
         try:
-            response = requests.get(
-                TOKEN_API_URL,
-                params={"uid": uid, "password": password},
-                timeout=20
-            )
-            response.raise_for_status()
-            token = response.json().get("token")
+            if TOKEN_API_URL.lower() in {"", "local", "self"}:
+                data, error = create_jwt_token(uid, password)
+                if error:
+                    raise RuntimeError(error)
+            else:
+                response = requests.get(
+                    TOKEN_API_URL,
+                    params={"uid": uid, "password": password},
+                    timeout=20
+                )
+                response.raise_for_status()
+                data = response.json()
+            token = data.get("token") if isinstance(data, dict) else None
             if token and isinstance(token, str):
                 return token
             last_error = "token missing in response"
@@ -189,14 +452,52 @@ def order_tokens_for_region(tokens, server_name):
 def select_token_for_region(tokens, server_name):
     matching_tokens = select_tokens_for_region(tokens, server_name)
     if matching_tokens:
-        return matching_tokens[0]["token"]
+        return token_value(matching_tokens[0])
     return None
 
 def first_token_value(tokens):
     if not tokens:
         return None
-    item = tokens[0]
-    return item.get("token") if isinstance(item, dict) else str(item)
+    return token_value(tokens[0])
+
+def token_value(token_item):
+    if isinstance(token_item, dict):
+        return str(token_item.get("token", "")).strip()
+    return str(token_item or "").strip()
+
+def build_freefire_headers(token):
+    return {
+        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        'Connection': "Keep-Alive",
+        'Accept-Encoding': "gzip",
+        'Authorization': f"Bearer {token}",
+        'Content-Type': "application/x-www-form-urlencoded",
+        'Expect': "100-continue",
+        'X-Unity-Version': "2018.4.11f1",
+        'X-GA': "v1 1",
+        'ReleaseVersion': RELEASE_VERSION,
+    }
+
+def like_result_summary(results):
+    summary = {"total": 0, "success": 0, "failed": 0, "statuses": {}}
+    for item in results or []:
+        summary["total"] += 1
+        if isinstance(item, Exception):
+            summary["failed"] += 1
+            key = item.__class__.__name__
+            summary["statuses"][key] = summary["statuses"].get(key, 0) + 1
+            continue
+        if not isinstance(item, dict):
+            summary["failed"] += 1
+            summary["statuses"]["unknown"] = summary["statuses"].get("unknown", 0) + 1
+            continue
+        status = str(item.get("status", "none"))
+        summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
+        if item.get("ok"):
+            summary["success"] += 1
+        else:
+            summary["failed"] += 1
+    return summary
 
 def fetch_external_ffinfo(uid, server_name):
     if not FFINFO_API_URL:
@@ -258,28 +559,18 @@ def create_protobuf_message(user_id, region):
 async def send_request(encrypted_uid, token, url):
     try:
         edata = bytes.fromhex(encrypted_uid)
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB53"
-        }
+        headers = build_freefire_headers(token)
         timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, data=edata, headers=headers) as response:
+                body = await response.text()
                 if response.status != 200:
-                    body = await response.text()
                     app.logger.error(f"Like request failed with status {response.status}: {body[:100]}")
-                    return response.status
-                return await response.text()
+                    return {"ok": False, "status": response.status, "body": body[:120]}
+                return {"ok": True, "status": response.status, "body": body[:120]}
     except Exception as e:
         app.logger.error(f"Exception in send_request: {e}")
-        return None
+        return {"ok": False, "status": "exception", "body": str(e)[:120]}
 
 async def send_multiple_requests(uid, server_name, url, tokens=None):
     try:
@@ -302,8 +593,12 @@ async def send_multiple_requests(uid, server_name, url, tokens=None):
         if not tokens:
             app.logger.error("No tokens found.")
             return None
-        for i in range(100):
-            token = tokens[i % len(tokens)]["token"]
+        tokens = [item for item in tokens if token_value(item)]
+        if not tokens:
+            app.logger.error("No usable token values found.")
+            return None
+        for i in range(LIKE_REQUESTS_PER_CALL):
+            token = token_value(tokens[i % len(tokens)])
             tasks.append(send_request(encrypted_uid, token, url))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return results
@@ -342,17 +637,7 @@ def make_request(encrypt, server_name, token):
             return None
             
         edata = bytes.fromhex(encrypt)
-        headers = {
-            'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-            'Connection': "Keep-Alive",
-            'Accept-Encoding': "gzip",
-            'Authorization': f"Bearer {token}",
-            'Content-Type': "application/x-www-form-urlencoded",
-            'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1",
-            'X-GA': "v1 1",
-            'ReleaseVersion': "OB53"
-        }
+        headers = build_freefire_headers(token)
         response = requests.post(
             url,
             data=edata,
@@ -391,22 +676,54 @@ def decode_protobuf(binary):
         app.logger.error(f"Unexpected error during protobuf decoding: {e}")
         return None
 
+
+@app.route('/token', methods=['GET'])
+def handle_token():
+    uid = str(request.args.get("uid", "")).strip()
+    password = str(request.args.get("password", "")).strip()
+    region = str(request.args.get("region", request.args.get("server_name", ""))).strip().upper()
+
+    if not uid or not password:
+        return jsonify({"status": "error", "error": "uid and password are required"}), 400
+    if not uid.isdigit():
+        return jsonify({"status": "error", "error": "uid must be numeric"}), 400
+
+    data, error = create_jwt_token(uid, password, region=region)
+    if error:
+        app.logger.error(f"Local token API failed for UID {uid}: {error}")
+        return jsonify({"status": "error", "error": error}), 502
+
+    return jsonify({
+        "status": "success",
+        "uid": uid,
+        "account_id": data.get("account_id") or uid,
+        "region": data.get("region") or data.get("lock_region") or region,
+        "access_token": data.get("access_token", ""),
+        "open_id": data.get("open_id", ""),
+        "token": data.get("token", ""),
+        "ttl": data.get("ttl", 0),
+        "server_url": data.get("server_url", ""),
+    })
+
+
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
         "credit": "https://t.me/mean_un",
         "message": "Welcome to the Free Fire Like API",
         "status": "API is running",
-        "endpoints": "/like?uid=<uid> or /like?uid=<uid>&server_name=<server_name>",
+        "endpoints": "/token?uid=<uid>&password=<password>, /like?uid=<uid> or /like?uid=<uid>&server_name=<server_name>",
         "example": "/like?uid=123456789 or /like?uid=123456789&server_name=bd"
 })
 
 
 @app.route('/like', methods=['GET'])
 def handle_requests():
-    uid = request.args.get("uid")
+    uid = str(request.args.get("uid", "")).strip()
     if not uid:
         return jsonify({"error": "UID is required"}), 400
+    if not uid.isdigit():
+        return jsonify({"error": "UID must be numeric"}), 400
 
     try:
         tokens = load_tokens()
@@ -414,9 +731,11 @@ def handle_requests():
             return jsonify({"error": "Failed to load tokens."}), 500
         
         # Extract server_name (lock_region) from token if not provided
-        server_name = request.args.get("server_name", "").upper()
+        server_name = str(request.args.get("server_name", "")).strip().upper()
+        if server_name and not server_name.replace("_", "").isalpha():
+            return jsonify({"error": "server_name must be a valid region code"}), 400
         if not server_name:
-            token = tokens[0]['token']
+            token = token_value(tokens[0])
             server_name = get_region_from_token(token)
         
         if not server_name:
@@ -439,6 +758,7 @@ def handle_requests():
                 app.logger.info(
                     f"No exact token for {server_name}. Using fallback token from available regions: {available_regions}"
                 )
+        tokens_for_send = order_tokens_for_region(tokens, server_name)
         
         encrypted_uid = enc(uid)
         if encrypted_uid is None:
@@ -456,6 +776,7 @@ def handle_requests():
                 token = first_token_value(tokens)
                 if token is None:
                     return jsonify({"error": f"Token refresh succeeded, but no token exists for region {server_name}."}), 500
+            tokens_for_send = order_tokens_for_region(tokens, server_name)
             before = make_request(encrypted_uid, server_name, token)
             if before is None:
                 return jsonify({"error": "Failed to retrieve player info. There are no valid token found! please update tokens.json with valid tokens"}), 500
@@ -473,8 +794,9 @@ def handle_requests():
             url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
         # Send like requests
-        requests_sent = asyncio.run(send_multiple_requests(uid, server_name, url, tokens=tokens))
-        app.logger.info(f"Requests sent: {requests_sent}")
+        requests_sent = asyncio.run(send_multiple_requests(uid, server_name, url, tokens=tokens_for_send))
+        request_summary = like_result_summary(requests_sent)
+        app.logger.info(f"Like request summary for uid={uid} region={server_name}: {request_summary}")
         if requests_sent is None:
             return jsonify({"error": "Failed to send like requests."}), 500
 
@@ -501,6 +823,23 @@ def handle_requests():
         player_name = str(account_info.get('PlayerNickname', 'Unknown')).strip()
         
         like_given = after_like - before_like
+        if like_given <= 0 and request_summary["success"] == 0:
+            app.logger.info("No like requests succeeded. Refreshing tokens and retrying send once.")
+            tokens = refresh_and_load_tokens()
+            if tokens:
+                token = select_token_for_region(tokens, server_name) or first_token_value(tokens)
+                retry_results = asyncio.run(send_multiple_requests(uid, server_name, url, tokens=order_tokens_for_region(tokens, server_name)))
+                retry_summary = like_result_summary(retry_results)
+                app.logger.info(f"Like retry summary for uid={uid} region={server_name}: {retry_summary}")
+                after_retry = make_request(encrypted_uid, server_name, token)
+                if after_retry is not None:
+                    data_after = json.loads(MessageToJson(after_retry))
+                    account_info = data_after.get('AccountInfo', {})
+                    after_like = int(account_info.get('Likes', 0) or 0)
+                    player_uid = str(account_info.get('UID', uid) or uid)
+                    player_name = str(account_info.get('PlayerNickname', player_name) or player_name).strip()
+                    like_given = after_like - before_like
+                    request_summary = retry_summary
         
         return jsonify({
             "credit": "https://t.me/mean_un",
@@ -509,6 +848,10 @@ def handle_requests():
             "LikesbeforeCommand": before_like,
             "PlayerNickname": player_name,
             "Region": server_name,
+            "RequestsSent": request_summary["total"],
+            "RequestsSucceeded": request_summary["success"],
+            "RequestsFailed": request_summary["failed"],
+            "RequestStatuses": request_summary["statuses"],
             "UID": player_uid,
             "status": 1 if like_given > 0 else 2
         })

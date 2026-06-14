@@ -6,7 +6,7 @@ import time
 
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
-API_URL = "https://xtytdtyj-jwt.up.railway.app/token"
+API_URL = os.getenv("TOKEN_API_URL", "http://127.0.0.1:5001/token").strip()
 TOKEN_RETRY_ATTEMPTS = 10
 TOKEN_RETRY_DELAY_SECONDS = 0.7
 

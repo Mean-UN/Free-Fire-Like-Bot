@@ -2,14 +2,17 @@
 import logging
 import os
 import random
+import sqlite3
 import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from urllib.parse import parse_qs, quote, urlparse
 import hashlib
 import html
 import hmac
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 import telebot
@@ -59,7 +62,7 @@ API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "90"))
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
-JWT_API_URL = os.getenv("JWT_API_URL", "https://xtytdtyj-jwt.up.railway.app/token").strip()
+JWT_API_URL = os.getenv("JWT_API_URL", f"{API_BASE_URL}/token").strip()
 JWT_RETRY_ATTEMPTS = int(os.getenv("JWT_RETRY_ATTEMPTS", "10"))
 JWT_RETRY_DELAY_SECONDS = float(os.getenv("JWT_RETRY_DELAY_SECONDS", "0.7"))
 BIO_API_KEY = os.getenv("BIO_API_KEY", os.getenv("API_KEY", "")).strip()
@@ -83,6 +86,32 @@ REQUIRED_CHANNELS = [item["username"] for item in CHANNELS]
 GROUP_JOIN_LINK = "https://t.me/freefirelikebotcambodia"
 OWNER_ID = 1126297297
 OWNER_USERNAME = "@mean_un"
+ADMIN_IDS = {
+    OWNER_ID,
+    *{
+        int(item.strip())
+        for item in os.getenv("ADMIN_IDS", "").split(",")
+        if item.strip().isdigit()
+    },
+}
+AUTO_LIKE_GROUP_ID_RAW = os.getenv("AUTO_LIKE_GROUP_ID", os.getenv("TELEGRAM_GROUP_ID", "")).strip()
+AUTO_LIKE_GROUP_ID = int(AUTO_LIKE_GROUP_ID_RAW) if AUTO_LIKE_GROUP_ID_RAW.lstrip("-").isdigit() else None
+AUTO_LIKE_DB_FILE = os.getenv("AUTO_LIKE_DB_FILE", "autolikes.db")
+try:
+    AUTO_LIKE_TIMEZONE = ZoneInfo("Asia/Phnom_Penh")
+except ZoneInfoNotFoundError:
+    AUTO_LIKE_TIMEZONE = timezone(timedelta(hours=7), name="Asia/Phnom_Penh")
+AUTO_LIKE_RUN_HOUR = int(os.getenv("AUTO_LIKE_RUN_HOUR", "9"))
+AUTO_LIKE_RUN_MINUTE = int(os.getenv("AUTO_LIKE_RUN_MINUTE", "0"))
+AUTO_LIKE_ORDER_DELAY_SECONDS = max(1, int(os.getenv("AUTO_LIKE_ORDER_DELAY_SECONDS", "30")))
+AUTO_LIKE_VALID_SERVERS = {
+    item.strip().upper()
+    for item in os.getenv(
+        "AUTO_LIKE_VALID_SERVERS",
+        "BD,SG,IND,BR,US,SAC,NA,EU,ME,TH,VN,ID,TW,RU,PK,CIS",
+    ).split(",")
+    if item.strip()
+}
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
 GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD")
@@ -691,6 +720,303 @@ def resolve_uid_region(uid):
     if not resolved_region:
         return "", "Could not detect UID region."
     return resolved_region, ""
+
+
+autolike_db_lock = threading.Lock()
+autolike_run_lock = threading.Lock()
+
+
+def is_admin_user(user_id):
+    return int(user_id or 0) in ADMIN_IDS
+
+
+def normalize_autolike_server(server):
+    server = str(server or "").strip().upper()
+    if server in {"EU", "EUR"}:
+        server = "EUROPE"
+    return server
+
+
+def autolike_db():
+    conn = sqlite3.connect(AUTO_LIKE_DB_FILE, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_autolike_db():
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autolike_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server TEXT NOT NULL,
+                    uid TEXT NOT NULL,
+                    player_name TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    telegram_user_id INTEGER NOT NULL,
+                    likes_before_purchase INTEGER NOT NULL,
+                    total_likes INTEGER NOT NULL,
+                    purchase_date TEXT NOT NULL,
+                    last_likes_before INTEGER NOT NULL,
+                    likes_added_today INTEGER NOT NULL DEFAULT 0,
+                    current_likes INTEGER NOT NULL,
+                    total_delivered INTEGER NOT NULL DEFAULT 0,
+                    remaining_likes INTEGER NOT NULL,
+                    progress_percent REAL NOT NULL DEFAULT 0,
+                    estimated_days INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_autolike_active_uid
+                ON autolike_orders(uid)
+                WHERE status = 'active'
+                """
+            )
+
+
+def row_to_dict(row):
+    return dict(row) if row is not None else None
+
+
+def autolike_now():
+    return datetime.now(AUTO_LIKE_TIMEZONE)
+
+
+def calc_autolike_fields(order, last_likes_before, current_likes):
+    likes_before_purchase = int(order["likes_before_purchase"])
+    total_likes = int(order["total_likes"])
+    likes_added_today = max(0, int(current_likes) - int(last_likes_before))
+    total_delivered = max(0, int(current_likes) - likes_before_purchase)
+    remaining_likes = max(0, total_likes - total_delivered)
+    progress_percent = min(100.0, round((total_delivered / total_likes) * 100, 2)) if total_likes > 0 else 100.0
+
+    try:
+        purchase_date = datetime.strptime(order["purchase_date"], "%Y-%m-%d").date()
+        elapsed_days = max(1, (autolike_now().date() - purchase_date).days + 1)
+    except Exception:
+        elapsed_days = 1
+    average_daily_likes = total_delivered / elapsed_days if elapsed_days else 0
+    estimated_days = ceil(remaining_likes / average_daily_likes) if remaining_likes > 0 and average_daily_likes > 0 else 0
+    status = "completed" if remaining_likes <= 0 else "active"
+    return {
+        "last_likes_before": int(last_likes_before),
+        "likes_added_today": likes_added_today,
+        "current_likes": int(current_likes),
+        "total_delivered": total_delivered,
+        "remaining_likes": remaining_likes,
+        "progress_percent": progress_percent,
+        "estimated_days": estimated_days,
+        "status": status,
+    }
+
+
+def get_autolike_order(uid, active_only=False):
+    query = "SELECT * FROM autolike_orders WHERE uid = ?"
+    params = [str(uid)]
+    if active_only:
+        query += " AND status = 'active'"
+    query += " ORDER BY id DESC LIMIT 1"
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            return row_to_dict(conn.execute(query, params).fetchone())
+
+
+def get_active_autolike_orders():
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            return [row_to_dict(row) for row in conn.execute("SELECT * FROM autolike_orders WHERE status = 'active' ORDER BY id ASC")]
+
+
+def get_user_autolike_orders(telegram_user_id):
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            return [
+                row_to_dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM autolike_orders WHERE telegram_user_id = ? AND status != 'removed' ORDER BY id ASC",
+                    (int(telegram_user_id),),
+                )
+            ]
+
+
+def update_autolike_order(uid, fields):
+    assignments = ", ".join([f"{key} = ?" for key in fields])
+    values = list(fields.values()) + [autolike_now().isoformat(timespec="seconds"), str(uid)]
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            conn.execute(
+                f"UPDATE autolike_orders SET {assignments}, updated_at = ? WHERE uid = ? AND status = 'active'",
+                values,
+            )
+
+
+def extract_player_snapshot(response):
+    if not isinstance(response, dict) or "error" in response:
+        return None, None, response.get("error", "Player information could not be fetched.") if isinstance(response, dict) else "Invalid player info response."
+
+    data = response.get("data", response)
+    if isinstance(data, dict) and isinstance(data.get("result"), dict):
+        data = data["result"]
+    if not isinstance(data, dict):
+        return None, None, "Player information response is invalid."
+
+    basic = pick(data, "basicInfo", "AccountInfo", default={})
+    if not isinstance(basic, dict):
+        basic = data
+
+    player_name = str(pick(basic, "nickname", "AccountName", "PlayerNickname", default="Unknown")).strip() or "Unknown"
+    likes = pick(basic, "liked", "likes", "AccountLikes", "Likes", default=None)
+    try:
+        return player_name, int(likes), ""
+    except (TypeError, ValueError):
+        return player_name, None, "Could not read current likes for this UID."
+
+
+def fetch_autolike_player_snapshot(server, uid):
+    response = call_ffinfo_api(server, uid)
+    if "error" in response and is_token_error(response.get("error", "")):
+        ok, count, total, failed_uids = refresh_tokens_from_uidpass()
+        if ok:
+            logger.info(
+                f"Auto-refreshed tokens before AutoLike player lookup. total={total} valid={count} failed={len(failed_uids)}"
+            )
+            response = call_ffinfo_api(server, uid)
+    if "error" in response:
+        direct = call_direct_ffinfo_api(server, uid)
+        if "error" not in direct:
+            response = direct
+    return extract_player_snapshot(response)
+
+
+def autolike_daily_message(order):
+    return (
+        "📊 ʏᴏᴜʀ ᴅᴀɪʟʏ ᴀᴜᴛᴏʟɪᴋᴇ ᴜᴘᴅᴀᴛᴇ 📊\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🆔 ᴜɪᴅ : {order['uid']}\n"
+        f"👤 ᴘʟᴀʏᴇʀ : {order['player_name']}\n\n"
+        "📊 ᴘʀᴏɢʀᴇss\n"
+        f"🤡 ʟɪᴋᴇs ʙᴇғᴏʀᴇ : {order['last_likes_before']}\n"
+        f"🚀 ʟɪᴋᴇs ᴀᴅᴅᴇᴅ : {order['likes_added_today']}\n"
+        f"🗿 ᴄᴜʀʀᴇɴᴛ ʟɪᴋᴇs : {order['current_likes']}\n"
+        f"☠️ ᴛᴏᴛᴀʟ ᴅᴇʟɪᴠᴇʀᴇᴅ : {order['total_delivered']}/{order['total_likes']}\n\n"
+        "📈 sᴛᴀᴛᴜs\n"
+        f"🌀 ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
+        f"❤️‍🩹 ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n"
+        f"📆 ᴇsᴛɪᴍᴀᴛᴇᴅ ᴅᴀʏs : {order['estimated_days']}\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
+    )
+
+
+def autolike_details_line(order, number):
+    return (
+        f"#{number}\n"
+        f"🆔 ᴜɪᴅ : {order['uid']}\n"
+        f"👤 ᴘʟᴀʏᴇʀ : {order['player_name']}\n"
+        f"🤡 ʟɪᴋᴇs ʙᴇғᴏʀᴇ ᴘᴜʀᴄʜᴀsᴇ : {order['likes_before_purchase']}\n"
+        f"🚀 ʟɪᴋᴇs ᴘᴜʀᴄʜᴀsᴇᴅ : {order['total_likes']}\n"
+        f"📅 ᴘᴜʀᴄʜᴀsᴇ ᴅᴀᴛᴇ : {order['purchase_date']}\n"
+        f"☠️ ᴛᴏᴛᴀʟ ʟɪᴋᴇs ɢɪᴠᴇɴ ʙʏ ʙᴏᴛ : {order['total_delivered']}\n"
+        f"🌀 ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
+        f"❤️‍🩹 ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n"
+        f"🗓️ ᴇsᴛɪᴍᴀᴛᴇᴅ ᴛɪᴍᴇ : {order['estimated_days']} days"
+    )
+
+
+def send_autolike_update(order):
+    text = autolike_daily_message(order)
+    private_error = None
+    try:
+        bot.send_message(int(order["telegram_user_id"]), text)
+    except Exception as e:
+        private_error = e
+        logger.warning(f"AutoLike private update failed for uid={order['uid']} user={order['telegram_user_id']}: {e}")
+
+    if AUTO_LIKE_GROUP_ID:
+        group_text = text
+        if private_error:
+            group_text += f"\n\nPrivate update failed for {order['username']} ({order['telegram_user_id']})."
+        try:
+            bot.send_message(AUTO_LIKE_GROUP_ID, group_text)
+        except Exception as e:
+            logger.error(f"AutoLike group update failed for uid={order['uid']}: {e}")
+
+
+def process_autolike_order(order):
+    uid = order["uid"]
+    if order["status"] != "active":
+        return
+
+    last_likes_before = int(order["current_likes"])
+    response = call_api(order["server"], uid)
+    if "error" in response and is_token_error(response.get("error", "")):
+        ok, count, total, failed_uids = refresh_tokens_from_uidpass()
+        if ok:
+            logger.info(f"AutoLike refreshed tokens. total={total} valid={count} failed={len(failed_uids)}")
+            response = call_api(order["server"], uid)
+
+    if "error" in response:
+        logger.error(f"AutoLike API error for uid={uid}: {response['error']}")
+        if AUTO_LIKE_GROUP_ID:
+            bot.send_message(AUTO_LIKE_GROUP_ID, f"❌ AutoLike failed for UID {uid}\nReason: {response['error']}")
+        return
+
+    player_name = str(response.get("PlayerNickname") or order["player_name"] or "Unknown").strip()
+    current_likes = int(response.get("LikesafterCommand") or order["current_likes"] or 0)
+    last_likes_before = int(response.get("LikesbeforeCommand") or last_likes_before)
+    fields = calc_autolike_fields(order, last_likes_before, current_likes)
+    fields["player_name"] = player_name
+    if fields["status"] == "completed":
+        fields["completed_at"] = autolike_now().isoformat(timespec="seconds")
+    update_autolike_order(uid, fields)
+    updated = get_autolike_order(uid)
+    send_autolike_update(updated)
+
+
+def seconds_until_next_autolike_run():
+    now = autolike_now()
+    next_run = now.replace(hour=AUTO_LIKE_RUN_HOUR, minute=AUTO_LIKE_RUN_MINUTE, second=0, microsecond=0)
+    if next_run <= now:
+        next_run += timedelta(days=1)
+    return max(1, (next_run - now).total_seconds())
+
+
+def run_daily_autolikes_once():
+    if not autolike_run_lock.acquire(blocking=False):
+        logger.info("AutoLike daily run skipped because another run is active.")
+        return
+    try:
+        orders = get_active_autolike_orders()
+        logger.info(f"AutoLike daily run started. active_orders={len(orders)}")
+        for index, order in enumerate(orders):
+            if index:
+                time.sleep(AUTO_LIKE_ORDER_DELAY_SECONDS)
+            try:
+                process_autolike_order(order)
+            except Exception as e:
+                logger.error(f"AutoLike order processing crashed for uid={order.get('uid')}: {e}", exc_info=True)
+        logger.info("AutoLike daily run finished.")
+    finally:
+        autolike_run_lock.release()
+
+
+def autolike_scheduler_loop():
+    while True:
+        try:
+            sleep_seconds = seconds_until_next_autolike_run()
+            logger.info(f"Next AutoLike run in {int(sleep_seconds)} seconds.")
+            time.sleep(sleep_seconds)
+            run_daily_autolikes_once()
+        except Exception as e:
+            logger.error(f"AutoLike scheduler error: {e}", exc_info=True)
+            time.sleep(60)
 
 
 def format_ffinfo_error(response, region, uid):
@@ -2283,20 +2609,24 @@ def process_like(message, region, uid):
             usage["used"] += 1
             usage["last_used"] = now_utc
             like_tracker[user_id] = usage
-            title = "✅ Request processed successfully"
+            title = "✓ ʀᴇǫᴜᴇsᴛ ᴘʀᴏᴄᴇssᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ"
         else:
-            title = "UID already reached max likes for now."
+            title = "ᴜɪᴅ ᴀʟʀᴇᴀᴅʏ ʀᴇᴀᴄʜᴇᴅ ᴍᴀx ʟɪᴋᴇs ғᴏʀ ɴᴏᴡ."
+
+        remaining_requests = max_limit - usage["used"]
+        if max_limit > 1000:
+            remaining_requests = 0
 
         response_text = (
             f"{title}\n\n"
-            f"👤 Name: {player_name}\n"
-            f"🆔 UID: {player_uid}\n"
-            f"🌍 Region: {region_name}\n"
-            f"❤️ Likes Before: {likes_before}\n"
-            f"➕ Likes Added: {likes_given}\n"
-            f"⭐ Total Likes Now: {likes_after}\n"
-            f"📊 Remaining Requests: {max_limit - usage['used']}\n"
-            "\n🔗 Credit: @Mean_Un"
+            f"› ɴᴀᴍᴇ : {player_name}\n"
+            f"› ᴜɪᴅ : {player_uid}\n"
+            f"› ʀᴇɢɪᴏɴ : {region_name}\n"
+            f"› ʟɪᴋᴇs ʙᴇғᴏʀᴇ : {likes_before}\n"
+            f"› ʟɪᴋᴇs ᴀᴅᴅᴇᴅ : {likes_given}\n"
+            f"› ᴛᴏᴛᴀʟ ɴᴏᴡ : {likes_after}\n"
+            f"› ʀᴇǫᴜᴇsᴛs : {remaining_requests}\n"
+            f"\n↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
         )
 
         bot.edit_message_text(
@@ -2315,6 +2645,192 @@ def process_like(message, region, uid):
             )
         except Exception:
             bot.reply_to(message, error_msg)
+
+
+@bot.message_handler(commands=["autolike"])
+def handle_autolike_add(message):
+    if not is_admin_user(message.from_user.id):
+        return
+
+    args = message.text.split()
+    if len(args) != 6:
+        bot.reply_to(message, "Use: /autolike <server> <uid> <total_likes> <username> <telegram_user_id>")
+        return
+
+    server = normalize_autolike_server(args[1])
+    uid = args[2].strip()
+    username = args[4].strip()
+    telegram_user_id = args[5].strip()
+
+    if server not in AUTO_LIKE_VALID_SERVERS and server != "EUROPE":
+        bot.reply_to(message, f"Invalid server. Supported: {', '.join(sorted(AUTO_LIKE_VALID_SERVERS))}")
+        return
+    if not uid.isdigit():
+        bot.reply_to(message, "Invalid UID. UID must be numeric.")
+        return
+    try:
+        total_likes = int(args[3])
+        telegram_user_id_int = int(telegram_user_id)
+    except ValueError:
+        bot.reply_to(message, "Invalid format. total_likes and telegram_user_id must be numbers.")
+        return
+    if total_likes <= 0:
+        bot.reply_to(message, "total_likes must be greater than 0.")
+        return
+    if not username.startswith("@"):
+        bot.reply_to(message, "username must start with @.")
+        return
+    if get_autolike_order(uid, active_only=True):
+        bot.reply_to(message, f"Duplicate active order: UID {uid} already has an active AutoLike order.")
+        return
+
+    processing_msg = bot.reply_to(message, "Adding AutoLike order... Fetching player profile.")
+    player_name, current_likes, error = fetch_autolike_player_snapshot(server, uid)
+    if error:
+        bot.edit_message_text(
+            text=f"Could not add AutoLike order for UID {uid}.\nReason: {error}",
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+        )
+        return
+
+    now = autolike_now()
+    purchase_date = now.strftime("%Y-%m-%d")
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO autolike_orders (
+                    server, uid, player_name, username, telegram_user_id,
+                    likes_before_purchase, total_likes, purchase_date,
+                    last_likes_before, likes_added_today, current_likes,
+                    total_delivered, remaining_likes, progress_percent,
+                    estimated_days, status, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, ?, 0, 0, 'active', ?, ?)
+                """,
+                (
+                    server,
+                    uid,
+                    player_name,
+                    username,
+                    telegram_user_id_int,
+                    current_likes,
+                    total_likes,
+                    purchase_date,
+                    current_likes,
+                    current_likes,
+                    total_likes,
+                    now.isoformat(timespec="seconds"),
+                    now.isoformat(timespec="seconds"),
+                ),
+            )
+
+    bot.edit_message_text(
+        text=(
+            "✅ AutoLike order added\n\n"
+            f"UID: {uid}\n"
+            f"Player: {player_name}\n"
+            f"Server: {server}\n"
+            f"Likes before purchase: {current_likes}\n"
+            f"Purchased likes: {total_likes}\n"
+            f"User: {username} ({telegram_user_id_int})"
+        ),
+        chat_id=processing_msg.chat.id,
+        message_id=processing_msg.message_id,
+    )
+
+
+@bot.message_handler(commands=["remove"])
+def handle_autolike_remove(message):
+    if not is_admin_user(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        bot.reply_to(message, "Use: /remove <uid>")
+        return
+    uid = args[1].strip()
+    order = get_autolike_order(uid, active_only=True)
+    if not order:
+        bot.reply_to(message, f"No active AutoLike order found for UID {uid}.")
+        return
+    update_autolike_order(uid, {"status": "removed"})
+    bot.reply_to(message, f"Removed AutoLike order for UID {uid}.")
+
+
+@bot.message_handler(commands=["extend"])
+def handle_autolike_extend(message):
+    if not is_admin_user(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) != 3 or not args[1].isdigit():
+        bot.reply_to(message, "Use: /extend <uid> <extra_likes>")
+        return
+    uid = args[1].strip()
+    try:
+        extra_likes = int(args[2])
+    except ValueError:
+        bot.reply_to(message, "extra_likes must be a number.")
+        return
+    if extra_likes <= 0:
+        bot.reply_to(message, "extra_likes must be greater than 0.")
+        return
+    order = get_autolike_order(uid, active_only=True)
+    if not order:
+        bot.reply_to(message, f"No active AutoLike order found for UID {uid}.")
+        return
+    new_total = int(order["total_likes"]) + extra_likes
+    fields = calc_autolike_fields({**order, "total_likes": new_total}, order["last_likes_before"], order["current_likes"])
+    fields["total_likes"] = new_total
+    update_autolike_order(uid, fields)
+    updated = get_autolike_order(uid, active_only=True)
+    bot.reply_to(message, f"Extended UID {uid} by {extra_likes} likes. New total: {updated['total_likes']}.")
+
+
+@bot.message_handler(commands=["status"])
+def handle_autolike_status(message):
+    if not is_admin_user(message.from_user.id):
+        return
+    args = message.text.split()
+    if len(args) != 2 or not args[1].isdigit():
+        bot.reply_to(message, "Use: /status <uid>")
+        return
+    order = get_autolike_order(args[1].strip())
+    if not order:
+        bot.reply_to(message, f"No AutoLike order found for UID {args[1]}.")
+        return
+    bot.reply_to(message, autolike_details_line(order, 1))
+
+
+@bot.message_handler(commands=["myautolikes"])
+def handle_myautolikes(message):
+    username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+    orders = get_user_autolike_orders(message.from_user.id)
+    if not orders:
+        bot.reply_to(message, f"Hello {username}\nYou have no AutoLike orders.")
+        return
+    parts = [f"Hello {username}\nYour AutoLike Details:"]
+    for index, order in enumerate(orders, start=1):
+        parts.append(autolike_details_line(order, index))
+    bot.reply_to(message, "\n\n".join(parts))
+
+
+@bot.message_handler(commands=["list"])
+def handle_autolike_list(message):
+    if not is_admin_user(message.from_user.id):
+        return
+    orders = get_active_autolike_orders()
+    if not orders:
+        bot.reply_to(message, "No active AutoLike orders.")
+        return
+    lines = ["Active AutoLike orders:"]
+    for order in orders:
+        lines.append(
+            f"UID {order['uid']} | {order['server']} | {order['username']} | "
+            f"{order['total_delivered']}/{order['total_likes']} ({order['progress_percent']}%) | "
+            f"remaining {order['remaining_likes']}"
+        )
+    bot.reply_to(message, "\n".join(lines))
 
 
 @bot.message_handler(commands=["bio"])
@@ -2644,6 +3160,11 @@ def help_command(message):
         help_text = (
             "Bot Commands:\n\n"
             "/like <region> <uid> - Send likes to Free Fire UID\n"
+            "/autolike <server> <uid> <total_likes> <username> <telegram_user_id> - Add AutoLike order\n"
+            "/remove <uid> - Remove AutoLike order\n"
+            "/extend <uid> <extra_likes> - Extend AutoLike order\n"
+            "/status <uid> - Show AutoLike progress\n"
+            "/list - Show active AutoLike orders\n"
             "/ffinfo <uid> - Show Free Fire player info\n"
             "/ffinfo <region> <uid> - Show player info for a region\n"
             "/bio <token/link> <text> - Update Free Fire bio\n"
@@ -2665,6 +3186,7 @@ def help_command(message):
     help_text = (
         "Bot Commands:\n\n"
         "/like <region> <uid> - Send likes to Free Fire UID\n"
+        "/myautolikes - Show your AutoLike orders\n"
         "/ffinfo <uid> - Show Free Fire player info\n"
         "/ffinfo <region> <uid> - Show player info for a region\n"
         "/bio <token/link> <text> - Update Free Fire bio\n"
@@ -2687,6 +3209,12 @@ def reply_all(message):
     known_commands = {
         "/start",
         "/like",
+        "/autolike",
+        "/remove",
+        "/extend",
+        "/status",
+        "/myautolikes",
+        "/list",
         "/ffinfo",
         "/bio",
         "/help",
@@ -2704,6 +3232,8 @@ def reply_all(message):
 
 
 if __name__ == "__main__":
+    init_autolike_db()
+    threading.Thread(target=autolike_scheduler_loop, daemon=True).start()
     mode = os.getenv("BOT_MODE", "polling").strip().lower()
     if mode == "webhook":
         port = int(os.getenv("PORT", "5000"))
