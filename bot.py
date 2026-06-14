@@ -2449,6 +2449,16 @@ def handle_id_lookup(message):
     )
 
 
+@bot.message_handler(content_types=["new_chat_members", "left_chat_member"])
+def auto_delete_group_service_messages(message):
+    if message.chat.type not in {"group", "supergroup"}:
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception as e:
+        logger.info(f"Could not delete group service message in chat {message.chat.id}: {e}")
+
+
 @bot.message_handler(commands=["like"])
 def handle_like(message):
     user_id = message.from_user.id
@@ -3278,7 +3288,6 @@ def help_command(message):
             "/myautolikes - Show your AutoLike orders\n"
             "/ffinfo [region] <uid> - Show Free Fire player info\n"
             "/bio <token/link> <text> - Update Free Fire bio\n"
-            "/id or /chatid - Show your user ID and current chat/group ID\n"
             "/start - Start or verify\n"
             "/help - Show this help menu\n\n"
             "Owner Commands:\n"
