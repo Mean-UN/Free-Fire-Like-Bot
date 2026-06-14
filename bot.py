@@ -2757,7 +2757,7 @@ def process_like(message, region, uid):
 
         remaining_requests = max_limit - usage["used"]
         if max_limit > 1000:
-            remaining_requests = 0
+            remaining_requests = "∞"
 
         response_text = (
             f"{title}\n\n"
