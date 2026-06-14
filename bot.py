@@ -97,6 +97,7 @@ ADMIN_IDS = {
 AUTO_LIKE_GROUP_ID_RAW = os.getenv("AUTO_LIKE_GROUP_ID", os.getenv("TELEGRAM_GROUP_ID", "")).strip()
 AUTO_LIKE_GROUP_ID = int(AUTO_LIKE_GROUP_ID_RAW) if AUTO_LIKE_GROUP_ID_RAW.lstrip("-").isdigit() else None
 AUTO_LIKE_DB_FILE = os.getenv("AUTO_LIKE_DB_FILE", "autolikes.db")
+AUTO_LIKE_GROUP_ID_ENV = AUTO_LIKE_GROUP_ID
 try:
     AUTO_LIKE_TIMEZONE = ZoneInfo("Asia/Phnom_Penh")
 except ZoneInfoNotFoundError:
@@ -727,7 +728,7 @@ autolike_run_lock = threading.Lock()
 
 
 def is_admin_user(user_id):
-    return int(user_id or 0) in ADMIN_IDS
+    return int(user_id or 0) == OWNER_ID
 
 
 def normalize_autolike_server(server):
@@ -779,10 +780,51 @@ def init_autolike_db():
                 WHERE status = 'active'
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS autolike_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
 
 
 def row_to_dict(row):
     return dict(row) if row is not None else None
+
+
+def get_autolike_setting(key, default=""):
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            row = conn.execute("SELECT value FROM autolike_settings WHERE key = ?", (key,)).fetchone()
+            return str(row["value"]) if row else default
+
+
+def set_autolike_setting(key, value):
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            conn.execute(
+                """
+                INSERT INTO autolike_settings(key, value)
+                VALUES(?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (key, str(value)),
+            )
+
+
+def delete_autolike_setting(key):
+    with autolike_db_lock:
+        with autolike_db() as conn:
+            conn.execute("DELETE FROM autolike_settings WHERE key = ?", (key,))
+
+
+def get_autolike_group_id():
+    value = get_autolike_setting("group_id", "")
+    if value.lstrip("-").isdigit():
+        return int(value)
+    return AUTO_LIKE_GROUP_ID_ENV
 
 
 def autolike_now():
@@ -897,19 +939,18 @@ def fetch_autolike_player_snapshot(server, uid):
 
 def autolike_daily_message(order):
     return (
-        "📊 ʏᴏᴜʀ ᴅᴀɪʟʏ ᴀᴜᴛᴏʟɪᴋᴇ ᴜᴘᴅᴀᴛᴇ 📊\n\n"
+        "✓ ʏᴏᴜʀ ᴅᴀɪʟʏ ᴀᴜᴛᴏʟɪᴋᴇ ᴜᴘᴅᴀᴛᴇ\n\n"
         "━━━━━━━━━━━━━━━\n"
-        f"🆔 ᴜɪᴅ : {order['uid']}\n"
-        f"👤 ᴘʟᴀʏᴇʀ : {order['player_name']}\n\n"
-        "📊 ᴘʀᴏɢʀᴇss\n"
-        f"🤡 ʟɪᴋᴇs ʙᴇғᴏʀᴇ : {order['last_likes_before']}\n"
-        f"🚀 ʟɪᴋᴇs ᴀᴅᴅᴇᴅ : {order['likes_added_today']}\n"
-        f"🗿 ᴄᴜʀʀᴇɴᴛ ʟɪᴋᴇs : {order['current_likes']}\n"
-        f"☠️ ᴛᴏᴛᴀʟ ᴅᴇʟɪᴠᴇʀᴇᴅ : {order['total_delivered']}/{order['total_likes']}\n\n"
-        "📈 sᴛᴀᴛᴜs\n"
-        f"🌀 ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
-        f"❤️‍🩹 ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n"
-        f"📆 ᴇsᴛɪᴍᴀᴛᴇᴅ ᴅᴀʏs : {order['estimated_days']}\n\n"
+        f"› ᴜɪᴅ : {order['uid']}\n"
+        f"› ᴘʟᴀʏᴇʀ : {order['player_name']}\n\n"
+        "› ᴘʀᴏɢʀᴇss\n"
+        f"› ʟɪᴋᴇs ʙᴇғᴏʀᴇ : {order['last_likes_before']}\n"
+        f"› ʟɪᴋᴇs ᴀᴅᴅᴇᴅ : {order['likes_added_today']}\n"
+        f"› ᴄᴜʀʀᴇɴᴛ ʟɪᴋᴇs : {order['current_likes']}\n"
+        f"› ᴛᴏᴛᴀʟ ᴅᴇʟɪᴠᴇʀᴇᴅ : {order['total_delivered']}/{order['total_likes']}\n\n"
+        "› sᴛᴀᴛᴜs\n"
+        f"› ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
+        f"› ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n\n"
         "━━━━━━━━━━━━━━━\n"
         f"↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
     )
@@ -939,12 +980,13 @@ def send_autolike_update(order):
         private_error = e
         logger.warning(f"AutoLike private update failed for uid={order['uid']} user={order['telegram_user_id']}: {e}")
 
-    if AUTO_LIKE_GROUP_ID:
+    group_id = get_autolike_group_id()
+    if group_id:
         group_text = text
         if private_error:
             group_text += f"\n\nPrivate update failed for {order['username']} ({order['telegram_user_id']})."
         try:
-            bot.send_message(AUTO_LIKE_GROUP_ID, group_text)
+            bot.send_message(group_id, group_text)
         except Exception as e:
             logger.error(f"AutoLike group update failed for uid={order['uid']}: {e}")
 
@@ -964,8 +1006,9 @@ def process_autolike_order(order):
 
     if "error" in response:
         logger.error(f"AutoLike API error for uid={uid}: {response['error']}")
-        if AUTO_LIKE_GROUP_ID:
-            bot.send_message(AUTO_LIKE_GROUP_ID, f"❌ AutoLike failed for UID {uid}\nReason: {response['error']}")
+        group_id = get_autolike_group_id()
+        if group_id:
+            bot.send_message(group_id, f"❌ AutoLike failed for UID {uid}\nReason: {response['error']}")
         return
 
     player_name = str(response.get("PlayerNickname") or order["player_name"] or "Unknown").strip()
@@ -2389,6 +2432,23 @@ def start_command(message):
     bot.reply_to(message, "You are verified. Use /like to send likes.")
 
 
+@bot.message_handler(commands=["id", "chatid"])
+def handle_id_lookup(message):
+    user = message.from_user
+    chat = message.chat
+    username = f"@{user.username}" if getattr(user, "username", None) else "N/A"
+    chat_label = "Group ID" if chat.type in {"group", "supergroup"} else "Chat ID"
+
+    bot.reply_to(
+        message,
+        "Telegram IDs\n\n"
+        f"User ID: {user.id}\n"
+        f"Username: {username}\n"
+        f"{chat_label}: {chat.id}\n"
+        f"Chat Type: {chat.type}",
+    )
+
+
 @bot.message_handler(commands=["like"])
 def handle_like(message):
     user_id = message.from_user.id
@@ -2728,17 +2788,21 @@ def handle_autolike_add(message):
 
     bot.edit_message_text(
         text=(
-            "✅ AutoLike order added\n\n"
-            f"UID: {uid}\n"
-            f"Player: {player_name}\n"
-            f"Server: {server}\n"
-            f"Likes before purchase: {current_likes}\n"
-            f"Purchased likes: {total_likes}\n"
-            f"User: {username} ({telegram_user_id_int})"
+            "✓ ᴀᴜᴛᴏʟɪᴋᴇ ᴏʀᴅᴇʀ ᴀᴅᴅᴇᴅ\n\n"
+            f"› ᴜɪᴅ : {uid}\n"
+            f"› ᴘʟᴀʏᴇʀ : {player_name}\n"
+            f"› sᴇʀᴠᴇʀ : {server}\n"
+            f"› ʟɪᴋᴇs ʙᴇғᴏʀᴇ ᴘᴜʀᴄʜᴀsᴇ : {current_likes}\n"
+            f"› ᴘᴜʀᴄʜᴀsᴇᴅ ʟɪᴋᴇs : {total_likes}\n"
+            f"› ᴜsᴇʀ : {username} ({telegram_user_id_int})\n\n"
+            f"↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
         ),
         chat_id=processing_msg.chat.id,
         message_id=processing_msg.message_id,
     )
+    order = get_autolike_order(uid, active_only=True)
+    if order:
+        threading.Thread(target=process_autolike_order, args=(order,), daemon=True).start()
 
 
 @bot.message_handler(commands=["remove"])
@@ -2831,6 +2895,57 @@ def handle_autolike_list(message):
             f"remaining {order['remaining_likes']}"
         )
     bot.reply_to(message, "\n".join(lines))
+
+
+@bot.message_handler(commands=["setautogroup"])
+def handle_set_autolike_group(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    args = message.text.split()
+    if len(args) == 2:
+        group_id_text = args[1].strip()
+    elif message.chat.type in {"group", "supergroup"}:
+        group_id_text = str(message.chat.id)
+    else:
+        bot.reply_to(message, "Use this in the group, or use: /setautogroup <group_id>")
+        return
+
+    if not group_id_text.lstrip("-").isdigit():
+        bot.reply_to(message, "Invalid group ID.")
+        return
+
+    set_autolike_setting("group_id", group_id_text)
+    bot.reply_to(
+        message,
+        "✓ ᴀᴜᴛᴏʟɪᴋᴇ ɢʀᴏᴜᴘ sᴇᴛ\n\n"
+        f"› ɢʀᴏᴜᴘ ɪᴅ : {group_id_text}\n\n"
+        f"↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}",
+    )
+
+
+@bot.message_handler(commands=["removeautogroup"])
+def handle_remove_autolike_group(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    delete_autolike_setting("group_id")
+    bot.reply_to(
+        message,
+        "✓ ᴀᴜᴛᴏʟɪᴋᴇ ɢʀᴏᴜᴘ ʀᴇᴍᴏᴠᴇᴅ\n\n"
+        "› ᴅᴀɪʟʏ ɢʀᴏᴜᴘ ᴜᴘᴅᴀᴛᴇs : ᴏғғ",
+    )
+
+
+@bot.message_handler(commands=["autogroup"])
+def handle_autolike_group_status(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    group_id = get_autolike_group_id()
+    bot.reply_to(
+        message,
+        "ᴀᴜᴛᴏʟɪᴋᴇ ɢʀᴏᴜᴘ\n\n"
+        f"› ɢʀᴏᴜᴘ ɪᴅ : {group_id or 'ɴᴏᴛ sᴇᴛ'}",
+    )
 
 
 @bot.message_handler(commands=["bio"])
@@ -3165,9 +3280,13 @@ def help_command(message):
             "/extend <uid> <extra_likes> - Extend AutoLike order\n"
             "/status <uid> - Show AutoLike progress\n"
             "/list - Show active AutoLike orders\n"
+            "/setautogroup [group_id] - Set AutoLike update group\n"
+            "/removeautogroup - Remove AutoLike update group\n"
+            "/autogroup - Show AutoLike update group\n"
             "/ffinfo <uid> - Show Free Fire player info\n"
             "/ffinfo <region> <uid> - Show player info for a region\n"
             "/bio <token/link> <text> - Update Free Fire bio\n"
+            "/id - Show your user ID and current chat/group ID\n"
             "/start - Start or verify\n"
             "/help - Show this help menu\n\n"
             "Owner Commands:\n"
@@ -3190,6 +3309,7 @@ def help_command(message):
         "/ffinfo <uid> - Show Free Fire player info\n"
         "/ffinfo <region> <uid> - Show player info for a region\n"
         "/bio <token/link> <text> - Update Free Fire bio\n"
+        "/id - Show your user ID and current chat/group ID\n"
         "/start - Start or verify\n"
         "/help - Show this help menu\n\n"
         f"Support: {OWNER_USERNAME}\n"
@@ -3208,6 +3328,8 @@ def reply_all(message):
 
     known_commands = {
         "/start",
+        "/id",
+        "/chatid",
         "/like",
         "/autolike",
         "/remove",
@@ -3215,6 +3337,9 @@ def reply_all(message):
         "/status",
         "/myautolikes",
         "/list",
+        "/setautogroup",
+        "/removeautogroup",
+        "/autogroup",
         "/ffinfo",
         "/bio",
         "/help",
