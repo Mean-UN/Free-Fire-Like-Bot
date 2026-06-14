@@ -26,6 +26,10 @@ from urllib.parse import urlparse
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
+if hasattr(app, "json"):
+    app.json.sort_keys = False
+else:
+    app.config["JSON_SORT_KEYS"] = False
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TOKENS_FILE = os.path.join(BASE_DIR, "tokens.json")
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
@@ -59,6 +63,7 @@ MAJOR_LOGIN_USER_AGENT = os.getenv(
     "MAJOR_LOGIN_USER_AGENT",
     "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)",
 )
+FF_NICKNAME_KEY = b"1e5898ccb8dfdd921f9bdea848768b64a201"
 FFINFO_DEFAULT_REGIONS = [
     region.strip().upper()
     for region in os.getenv("FFINFO_DEFAULT_REGIONS", "SG,IND,BD,BR,US,SAC,NA,EU,ME,TH,VN,ID,TW,RU").split(",")
@@ -252,10 +257,78 @@ def decode_major_login_info(raw_bytes):
         "account_id": str(message.account_id or ""),
         "region": message.lock_region,
         "lock_region": message.lock_region,
+        "noti_region": message.noti_region,
+        "ip_region": message.ip_region,
+        "agora_environment": message.agora_environment,
+        "new_active_region": message.new_active_region,
         "token": message.token,
         "ttl": message.ttl,
         "server_url": message.server_url,
+        "emulator_score": message.emulator_score,
+        "tp_url": message.tp_url,
+        "app_server_id": message.app_server_id,
+        "ano_url": message.ano_url,
+        "ip_city": message.ip_city,
+        "ip_subdivision": message.ip_subdivision,
+        "kts": message.kts,
     }
+
+
+def decode_jwt_payload(token):
+    try:
+        payload = str(token or "").split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def decode_ff_nickname(encoded):
+    try:
+        raw = base64.b64decode(str(encoded or ""))
+        decoded = bytearray()
+        for index, byte in enumerate(raw):
+            decoded.append(byte ^ FF_NICKNAME_KEY[index % len(FF_NICKNAME_KEY)])
+        return decoded.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def format_ttl(seconds):
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return seconds
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours} hours, {minutes} mins, {secs} secs"
+
+
+def convert_timestamps_to_human(data):
+    if isinstance(data, dict):
+        converted = {}
+        for key, value in data.items():
+            if isinstance(value, (int, float)) and 1000000000 < value < 3000000000:
+                human_time = datetime.utcfromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S UTC")
+                converted[key] = f"{value} ({human_time})"
+            else:
+                converted[key] = convert_timestamps_to_human(value)
+        return converted
+    if isinstance(data, list):
+        return [convert_timestamps_to_human(item) for item in data]
+    return data
+
+
+def jwt_region_from_data(data):
+    claims = decode_jwt_payload(data.get("token", ""))
+    region = (
+        data.get("lock_region")
+        or data.get("noti_region")
+        or claims.get("lock_region")
+        or claims.get("noti_region")
+    )
+    return str(region or "").upper()
 
 
 def create_jwt_token(uid, password, region=""):
@@ -409,11 +482,12 @@ if ENABLE_AUTO_TOKEN_REFRESH:
 
 def get_region_from_token(token):
     try:
-        payload = token.split('.')[1]
-        payload += '=' * (-len(payload) % 4)
-        decoded_payload = base64.urlsafe_b64decode(payload).decode('utf-8')
-        parsed_payload = json.loads(decoded_payload)
-        return parsed_payload.get('lock_region', '').upper()
+        parsed_payload = decode_jwt_payload(token)
+        return (
+            parsed_payload.get('lock_region')
+            or parsed_payload.get('noti_region')
+            or ''
+        ).upper()
     except Exception as e:
         app.logger.error(f"Error decoding token payload: {e}")
         return ""
@@ -678,26 +752,60 @@ def decode_protobuf(binary):
 
 
 @app.route('/token', methods=['GET'])
+@app.route('/guest', methods=['GET'])
 def handle_token():
     uid = str(request.args.get("uid", "")).strip()
-    password = str(request.args.get("password", "")).strip()
+    password = str(request.args.get("password", request.args.get("pw", ""))).strip()
     region = str(request.args.get("region", request.args.get("server_name", ""))).strip().upper()
 
     if not uid or not password:
-        return jsonify({"status": "error", "error": "uid and password are required"}), 400
+        return jsonify({"status": "error", "message": "Missing parameters. Use /token?uid=xxx&password=xxx or /guest?uid=xxx&pw=xxx"}), 400
     if not uid.isdigit():
-        return jsonify({"status": "error", "error": "uid must be numeric"}), 400
+        return jsonify({"status": "error", "message": "uid must be numeric"}), 400
 
     data, error = create_jwt_token(uid, password, region=region)
     if error:
         app.logger.error(f"Local token API failed for UID {uid}: {error}")
-        return jsonify({"status": "error", "error": error}), 502
+        return jsonify({"status": "error", "message": error}), 502
+
+    claims = decode_jwt_payload(data.get("token", ""))
+    resolved_region = jwt_region_from_data(data)
+    nickname = decode_ff_nickname(claims.get("nickname", "")) or data.get("nickname", "")
+
+    token_data = data.get("token_data") if isinstance(data.get("token_data"), dict) else {}
+    major_login = {
+        "account_id": data.get("account_id") or uid,
+        "nickname": nickname or "Unknown",
+        "lock_region": data.get("lock_region", ""),
+        "noti_region": data.get("noti_region", ""),
+        "ip_region": data.get("ip_region", ""),
+        "agora_environment": data.get("agora_environment", ""),
+        "new_active_region": data.get("new_active_region", ""),
+        "token": data.get("token", ""),
+        "ttl": format_ttl(data.get("ttl", 0)),
+        "server_url": data.get("server_url", ""),
+        "emulator_score": data.get("emulator_score", 0),
+        "tp_url": data.get("tp_url", ""),
+        "app_server_id": data.get("app_server_id", 0),
+        "ano_url": data.get("ano_url", ""),
+        "ip_city": data.get("ip_city", ""),
+        "ip_subdivision": data.get("ip_subdivision", ""),
+        "kts": data.get("kts", 0),
+    }
+    major_login = {key: value for key, value in major_login.items() if value not in ("", None, 0)}
 
     return jsonify({
+        "creator": "Crownx64Alone",
         "status": "success",
+        "Guest_Auth": convert_timestamps_to_human(token_data),
+        "MajorLogin": convert_timestamps_to_human(major_login),
         "uid": uid,
         "account_id": data.get("account_id") or uid,
-        "region": data.get("region") or data.get("lock_region") or region,
+        "nickname": nickname,
+        "name": nickname,
+        "region": resolved_region,
+        "lock_region": data.get("lock_region") or claims.get("lock_region", ""),
+        "noti_region": data.get("noti_region") or claims.get("noti_region", ""),
         "access_token": data.get("access_token", ""),
         "open_id": data.get("open_id", ""),
         "token": data.get("token", ""),

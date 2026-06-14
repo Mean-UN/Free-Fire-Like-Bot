@@ -2228,22 +2228,94 @@ def short_secret(value, head=18, tail=12):
     return f"{text[:head]}...{text[-tail:]}"
 
 
+def decode_jwt_payload(token):
+    try:
+        import base64
+
+        payload = str(token or "").split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def nested_get(data, path, default=""):
+    value = data
+    for key in path.split("."):
+        if isinstance(value, dict):
+            value = value.get(key)
+        else:
+            return default
+    return value if value not in (None, "") else default
+
+
+def extract_jwt_check_tokens(data):
+    major_login = data.get("MajorLogin") if isinstance(data.get("MajorLogin"), dict) else {}
+    access_token = (
+        data.get("access_token")
+        or nested_get(data, "Guest_Auth.data.access_token")
+        or ""
+    )
+    jwt_token = data.get("token") or major_login.get("token") or ""
+    return str(access_token or ""), str(jwt_token or "")
+
+
+def build_jwt_copy_markup(data):
+    access_token, jwt_token = extract_jwt_check_tokens(data)
+    markup = InlineKeyboardMarkup()
+    if access_token:
+        markup.add(InlineKeyboardButton("Copy Access Token", copy_text=CopyTextButton(access_token)))
+    if jwt_token:
+        markup.add(InlineKeyboardButton("Copy JWT Token", copy_text=CopyTextButton(jwt_token)))
+    return markup if markup.keyboard else None
+
+
 def format_jwt_check_result(uid, data, attempts):
-    access_token = data.get("access_token", "N/A")
-    account_id = data.get("account_id", "N/A")
-    region = data.get("region", "N/A")
-    token = data.get("token", "N/A")
+    major_login = data.get("MajorLogin") if isinstance(data.get("MajorLogin"), dict) else {}
+    access_token, token = extract_jwt_check_tokens(data)
+    access_token = access_token or "N/A"
+    account_id = (
+        data.get("account_id")
+        or major_login.get("account_id")
+        or uid
+        or "N/A"
+    )
+    token = token or "N/A"
+    claims = decode_jwt_payload(token)
+    name = (
+        data.get("name")
+        or data.get("nickname")
+        or major_login.get("nickname")
+        or data.get("player_name")
+        or ""
+    )
+    region = (
+        major_login.get("lock_region")
+        or major_login.get("noti_region")
+        or data.get("lock_region")
+        or data.get("noti_region")
+        or claims.get("lock_region")
+        or claims.get("noti_region")
+        or "N/A"
+    )
+    safe_account_id = html.escape(str(account_id))
+    safe_name = html.escape(str(name))
+    safe_region = html.escape(str(region))
+    safe_access_token = html.escape(str(access_token))
+    safe_token = html.escape(str(token))
 
     return (
         "✅ JWT CHECK SUCCESS\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"👤 Account ID: {account_id}\n"
-        f"🌐 Region: {region}\n"
+        f"👤 Account ID: <code>{safe_account_id}</code>\n"
+        + (f"🏷 Name: {safe_name}\n" if name else "")
+        +
+        f"🌐 Region: {safe_region}\n"
         "\n"
         "🔑 Access Token\n"
-        f"{access_token}\n\n"
+        f"<code>{safe_access_token}</code>\n\n"
         "🎟 JWT Token\n"
-        f"{token}"
+        f"<code>{safe_token}</code>"
     )
 
 
@@ -3127,6 +3199,7 @@ def process_checkjwt(message, uid, password):
 
     if data:
         text = format_jwt_check_result(uid, data, attempts)
+        parse_mode = "HTML"
     else:
         text = (
             "❌ JWT CHECK FAILED\n"
@@ -3136,11 +3209,17 @@ def process_checkjwt(message, uid, password):
             f"⏱ Delay: {JWT_RETRY_DELAY_SECONDS}s\n\n"
             f"Reason: {error}"
         )
+        parse_mode = None
 
     try:
-        bot.edit_message_text(text=text, chat_id=processing_msg.chat.id, message_id=processing_msg.message_id)
+        bot.edit_message_text(
+            text=text,
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+            parse_mode=parse_mode,
+        )
     except Exception:
-        bot.reply_to(message, text)
+        bot.reply_to(message, text, parse_mode=parse_mode)
 
 
 @bot.message_handler(commands=["remain", "uidpass", "adduidpass", "updateuidpass", "addremain", "checkjwt"])
