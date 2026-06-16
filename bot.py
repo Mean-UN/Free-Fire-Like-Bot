@@ -717,6 +717,12 @@ def resolve_uid_region(uid):
     if "error" in response:
         return "", response.get("error", "Could not resolve UID region.")
 
+    try:
+        if is_player_not_found_error(json.dumps(response, ensure_ascii=False)):
+            return "", "Player not found."
+    except Exception:
+        pass
+
     resolved_region = extract_ffinfo_region(response)
     if not resolved_region:
         return "", "Could not detect UID region."
@@ -1090,6 +1096,19 @@ def format_ffinfo_error(response, region, uid):
         return "⚠️ The player info service is temporarily unavailable. Please try again later."
 
     return f"❌ Unable to fetch player profile.\n\nReason: {response.get('error', 'Unknown error')}"
+
+
+def is_player_not_found_error(message):
+    text = str(message or "").strip().lower()
+    return any(
+        marker in text
+        for marker in (
+            "player not found",
+            "profile not found",
+            "account not found",
+            "br_account_not_found",
+        )
+    )
 
 
 def pick(data, *paths, default="N/A"):
@@ -2679,6 +2698,18 @@ def process_like(message, region, uid):
         region = resolved_region
     elif region_error:
         logger.info(f"Could not auto-detect region for UID {uid}: {region_error}")
+        if is_player_not_found_error(region_error):
+            bot.edit_message_text(
+                text=(
+                    "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
+                    f"› ᴜɪᴅ : {uid}\n"
+                    f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
+                    "Please check the UID and region, then try again."
+                ),
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+            )
+            return
 
     try:
         bot.edit_message_text(
