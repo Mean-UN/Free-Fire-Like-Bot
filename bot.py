@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "90"))
+FFINFO_LOOKUP_TIMEOUT_SECONDS = 8
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 JWT_API_URL = os.getenv("JWT_API_URL", f"{API_BASE_URL}/token").strip()
@@ -603,14 +604,15 @@ def format_like_error(response, region, uid):
     return f"❌ Unable to send likes.\n\nReason: {message or 'Unknown error'}"
 
 
-def call_ffinfo_api(region, uid):
+def call_ffinfo_api(region, uid, timeout_seconds=None):
     url = f"{API_BASE_URL}/ffinfo"
     params = {"uid": uid}
     if region:
         params["server_name"] = region
+    timeout_seconds = timeout_seconds or API_TIMEOUT_SECONDS
     try:
         logger.info(f"Calling FF info API: url={url} region={region or 'AUTO'} uid={uid}")
-        response = requests.get(url, params=params, timeout=API_TIMEOUT_SECONDS)
+        response = requests.get(url, params=params, timeout=timeout_seconds)
         if response.status_code != 200:
             try:
                 payload = response.json()
@@ -630,8 +632,8 @@ def call_ffinfo_api(region, uid):
         logger.error(f"FF info API connection failed: {e}")
         return {"error": f"Cannot connect to API at {API_BASE_URL}. Start app.py or fix API_BASE_URL."}
     except requests.exceptions.Timeout:
-        logger.error(f"FF info API timeout after {API_TIMEOUT_SECONDS}s for uid={uid} region={region}")
-        return {"error": f"API timed out after {API_TIMEOUT_SECONDS}s. Please try again."}
+        logger.error(f"FF info API timeout after {timeout_seconds}s for uid={uid} region={region}")
+        return {"error": f"API timed out after {timeout_seconds}s. Please try again."}
     except requests.exceptions.RequestException as e:
         logger.error(f"FF info API request failed: {e}")
         return {"error": "API failed. Please try again later."}
@@ -705,14 +707,14 @@ def extract_ffinfo_region(response):
 
 
 def resolve_uid_region(uid):
-    response = call_ffinfo_api("", uid)
+    response = call_ffinfo_api("", uid, timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS)
     if "error" in response and is_token_error(response.get("error", "")):
         ok, count, total, failed_uids = refresh_tokens_from_uidpass()
         if ok:
             logger.info(
                 f"Auto-refreshed tokens before region lookup. total={total} valid={count} failed={len(failed_uids)}"
             )
-            response = call_ffinfo_api("", uid)
+            response = call_ffinfo_api("", uid, timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS)
 
     if "error" in response:
         return "", response.get("error", "Could not resolve UID region.")
@@ -2698,18 +2700,17 @@ def process_like(message, region, uid):
         region = resolved_region
     elif region_error:
         logger.info(f"Could not auto-detect region for UID {uid}: {region_error}")
-        if is_player_not_found_error(region_error):
-            bot.edit_message_text(
-                text=(
-                    "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
-                    f"› ᴜɪᴅ : {uid}\n"
-                    f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
-                    "Please check the UID and region, then try again."
-                ),
-                chat_id=processing_msg.chat.id,
-                message_id=processing_msg.message_id,
-            )
-            return
+        bot.edit_message_text(
+            text=(
+                "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
+                f"› ᴜɪᴅ : {uid}\n"
+                f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
+                "Please check the UID and region, then try again."
+            ),
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+        )
+        return
 
     try:
         bot.edit_message_text(
