@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
 API_TIMEOUT_SECONDS = int(os.getenv("API_TIMEOUT_SECONDS", "90"))
-FFINFO_LOOKUP_TIMEOUT_SECONDS = 8
+FFINFO_LOOKUP_TIMEOUT_SECONDS = 15
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 JWT_API_URL = os.getenv("JWT_API_URL", f"{API_BASE_URL}/token").strip()
@@ -967,15 +967,15 @@ def autolike_daily_message(order):
 def autolike_details_line(order, number):
     return (
         f"#{number}\n"
-        f"🆔 ᴜɪᴅ : {order['uid']}\n"
-        f"👤 ᴘʟᴀʏᴇʀ : {order['player_name']}\n"
-        f"🤡 ʟɪᴋᴇs ʙᴇғᴏʀᴇ ᴘᴜʀᴄʜᴀsᴇ : {order['likes_before_purchase']}\n"
-        f"🚀 ʟɪᴋᴇs ᴘᴜʀᴄʜᴀsᴇᴅ : {order['total_likes']}\n"
-        f"📅 ᴘᴜʀᴄʜᴀsᴇ ᴅᴀᴛᴇ : {order['purchase_date']}\n"
-        f"☠️ ᴛᴏᴛᴀʟ ʟɪᴋᴇs ɢɪᴠᴇɴ ʙʏ ʙᴏᴛ : {order['total_delivered']}\n"
-        f"🌀 ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
-        f"❤️‍🩹 ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n"
-        f"🗓️ ᴇsᴛɪᴍᴀᴛᴇᴅ ᴛɪᴍᴇ : {order['estimated_days']} days"
+        f"› ᴜɪᴅ : {order['uid']}\n"
+        f"› ᴘʟᴀʏᴇʀ : {order['player_name']}\n"
+        f"› ʟɪᴋᴇs ʙᴇғᴏʀᴇ ᴘᴜʀᴄʜᴀsᴇ : {order['likes_before_purchase']}\n"
+        f"› ʟɪᴋᴇs ᴘᴜʀᴄʜᴀsᴇᴅ : {order['total_likes']}\n"
+        f"› ᴘᴜʀᴄʜᴀsᴇ ᴅᴀᴛᴇ : {order['purchase_date']}\n"
+        f"› ᴛᴏᴛᴀʟ ʟɪᴋᴇs ɢɪᴠᴇɴ ʙʏ ʙᴏᴛ : {order['total_delivered']}\n"
+        f"› ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
+        f"› ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n"
+        f"› ᴇsᴛɪᴍᴀᴛᴇᴅ ᴛɪᴍᴇ : {order['estimated_days']} days"
     )
 
 
