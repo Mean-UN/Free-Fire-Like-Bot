@@ -42,7 +42,6 @@ FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
 RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB53").strip() or "OB53"
-LIKE_REQUESTS_PER_CALL = max(1, int(os.getenv("LIKE_REQUESTS_PER_CALL", "100")))
 MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
 MAIN_IV = b"6oyZDr22E3ychjM%"
 GUEST_TOKEN_GRANT_URLS = (
@@ -561,16 +560,21 @@ def like_result_summary(results):
             key = item.__class__.__name__
             summary["statuses"][key] = summary["statuses"].get(key, 0) + 1
             continue
-        if not isinstance(item, dict):
-            summary["failed"] += 1
-            summary["statuses"]["unknown"] = summary["statuses"].get("unknown", 0) + 1
-            continue
-        status = str(item.get("status", "none"))
-        summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
-        if item.get("ok"):
+        if isinstance(item, str):
             summary["success"] += 1
-        else:
+            summary["statuses"]["200"] = summary["statuses"].get("200", 0) + 1
+            continue
+        if isinstance(item, int):
             summary["failed"] += 1
+            status = str(item)
+            summary["statuses"][status] = summary["statuses"].get(status, 0) + 1
+            continue
+        if item is None:
+            summary["failed"] += 1
+            summary["statuses"]["none"] = summary["statuses"].get("none", 0) + 1
+            continue
+        summary["failed"] += 1
+        summary["statuses"]["unknown"] = summary["statuses"].get("unknown", 0) + 1
     return summary
 
 def fetch_external_ffinfo(uid, server_name):
@@ -637,14 +641,13 @@ async def send_request(encrypted_uid, token, url):
         timeout = aiohttp.ClientTimeout(total=UPSTREAM_TIMEOUT_SECONDS)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, data=edata, headers=headers) as response:
-                body = await response.text()
                 if response.status != 200:
-                    app.logger.error(f"Like request failed with status {response.status}: {body[:100]}")
-                    return {"ok": False, "status": response.status, "body": body[:120]}
-                return {"ok": True, "status": response.status, "body": body[:120]}
+                    app.logger.error(f"Request failed with status code: {response.status}")
+                    return response.status
+                return await response.text()
     except Exception as e:
         app.logger.error(f"Exception in send_request: {e}")
-        return {"ok": False, "status": "exception", "body": str(e)[:120]}
+        return None
 
 async def send_multiple_requests(uid, server_name, url, tokens=None):
     try:
@@ -671,8 +674,8 @@ async def send_multiple_requests(uid, server_name, url, tokens=None):
         if not tokens:
             app.logger.error("No usable token values found.")
             return None
-        for i in range(LIKE_REQUESTS_PER_CALL):
-            token = token_value(tokens[i % len(tokens)])
+        for item in tokens:
+            token = token_value(item)
             tasks.append(send_request(encrypted_uid, token, url))
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return results
@@ -956,10 +959,6 @@ def handle_requests():
             "LikesbeforeCommand": before_like,
             "PlayerNickname": player_name,
             "Region": server_name,
-            "RequestsSent": request_summary["total"],
-            "RequestsSucceeded": request_summary["success"],
-            "RequestsFailed": request_summary["failed"],
-            "RequestStatuses": request_summary["statuses"],
             "UID": player_uid,
             "status": 1 if like_given > 0 else 2
         })
