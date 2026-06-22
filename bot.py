@@ -604,11 +604,13 @@ def format_like_error(response, region, uid):
     return f"❌ Unable to send likes.\n\nReason: {message or 'Unknown error'}"
 
 
-def call_ffinfo_api(region, uid, timeout_seconds=None):
+def call_ffinfo_api(region, uid, timeout_seconds=None, local_only=False):
     url = f"{API_BASE_URL}/ffinfo"
     params = {"uid": uid}
     if region:
         params["server_name"] = region
+    if local_only:
+        params["local"] = "1"
     timeout_seconds = timeout_seconds or API_TIMEOUT_SECONDS
     try:
         logger.info(f"Calling FF info API: url={url} region={region or 'AUTO'} uid={uid}")
@@ -1145,6 +1147,75 @@ def format_unix_date(value):
         return str(value)
 
 
+def compact_list(value, limit=4, default="N/A"):
+    if value in (None, "", "N/A"):
+        return default
+    if not isinstance(value, list):
+        return str(value)
+    items = [str(item) for item in value if item not in (None, "", "N/A")]
+    if not items:
+        return default
+    shown = items[:limit]
+    suffix = f", +{len(items) - limit} more" if len(items) > limit else ""
+    return ", ".join(shown) + suffix
+
+
+def multiline_list(value, prefix="• ", limit=6, default="N/A"):
+    if value in (None, "", "N/A"):
+        return default
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",") if item.strip()]
+    elif isinstance(value, list):
+        items = [str(item).strip() for item in value if item not in (None, "", "N/A")]
+    else:
+        items = [str(value)]
+    if not items:
+        return default
+    shown = items[:limit]
+    lines = [f"{prefix}{item}" for item in shown]
+    if len(items) > limit:
+        lines.append(f"{prefix}+{len(items) - limit} more")
+    return "\n".join(lines)
+
+
+def compact_history(history, limit=5):
+    if not isinstance(history, list) or not history:
+        return "N/A"
+    lines = []
+    for item in history[:limit]:
+        if not isinstance(item, dict):
+            continue
+        event_id = pick(item, "epEventId", "eventId", default="N/A")
+        badge_count = pick(item, "badgeCnt", "badgeCount", default="N/A")
+        owned = " | Pass" if item.get("ownedPass") else ""
+        lines.append(f"S{event_id}: {format_number(badge_count)} badges{owned}")
+    return "\n".join(lines) if lines else "N/A"
+
+
+def is_missing_value(value):
+    if value in (None, ""):
+        return True
+    text = str(value).strip()
+    return text in {"", "N/A", "None", "0", "0/100"}
+
+
+def info_line(label, value):
+    if is_missing_value(value):
+        return ""
+    if not label:
+        return f"{value}\n"
+    if isinstance(value, str) and value.startswith("\n"):
+        return f"{label}:\n{value.lstrip()}\n"
+    return f"{label}: {value}\n"
+
+
+def info_section(title, lines):
+    body = "".join(line for line in lines if line)
+    if not body.strip():
+        return ""
+    return f"{title}\n━━━━━━━━━━━━━━━━━━\n{body.rstrip()}"
+
+
 def clean_enum(value):
     text = str(value or "N/A")
     for prefix in ("Language_", "ExternalIconShowType_", "AccountPrivacy_", "Privacy_"):
@@ -1326,22 +1397,36 @@ def build_ffinfo_text(payload, requester):
     social = pick(data, "socialInfo", "socialinfo", default={})
     pet = pick(data, "petInfo", default={})
     credit = pick(data, "creditScoreInfo", default={})
+    history = pick(data, "historyEpInfo", default=[])
+    workshop_maps = pick(data, "workshop_maps", "workshopMaps", default=[])
 
     nickname = pick(basic, "nickname", "AccountName", "PlayerNickname")
     uid = pick(basic, "accountId", "AccountId", "AccountID", "UID")
     region = pick(basic, "region", "AccountRegion", default=payload.get("Region", "N/A"))
     level = pick(basic, "level", "AccountLevel")
+    level_progress = pick(basic, "levelProgress", default="N/A")
     exp = pick(basic, "exp", "AccountEXP")
+    exp_needed = pick(basic, "expNeeded", default="N/A")
     likes = pick(basic, "liked", "likes", "AccountLikes", "Likes")
     badges = pick(basic, "badgeCnt", "badgeCount", "AccountBPBadges", "badges")
     prime_level = pick(basic, "primeLevel.level", "primeInfo.primeLevel", default=0)
     title = pick(basic, "title", "Title", "AccountTitle", "TitleID")
+    title_name = pick(basic, "titleName", default="N/A")
+    banner_name = pick(basic, "bannerName", default="N/A")
+    avatar_name = pick(basic, "headPicName", default="N/A")
+    equipped_gun = pick(basic, "equippedGunName", default="N/A")
+    equipped_animation = pick(basic, "equippedAnimationName", default="N/A")
+    weapon_skins = pick(basic, "weaponSkinNames", default=[])
+    release_version = pick(basic, "releaseVersion", default="N/A")
+    ban_status = pick(basic, "banStatus", default="N/A")
     created = pick(basic, "createAt", "createdAt", "AccountCreateTime")
     last_login = pick(basic, "lastLoginAt", "lastLogin", "AccountLastLogin")
     br_rank = pick(basic, "rank", "BrRank", "maxRank", "BrMaxRank")
     br_points = pick(basic, "rankingPoints", "BrRankPoint")
+    br_ranking_name = pick(basic, "rankingName", default="")
     cs_rank = pick(basic, "csRank", "CsRank", "csMaxRank", "CsMaxRank")
     cs_points = pick(basic, "csRankingPoints", "CsRankPoint", "csRankPoint")
+    cs_ranking_name = pick(basic, "csRankingName", default="")
     cs_stars = cs_visible_stars(cs_rank, cs_points)
     clan_members = pick(clan, "memberNum", "GuildMember")
     clan_capacity = pick(clan, "capacity", "GuildCapacity")
@@ -1351,51 +1436,55 @@ def build_ffinfo_text(payload, requester):
     captain_likes = pick(captain, "liked", "AccountLikes")
     captain_br_rank = pick(captain, "rank", "BrRank", "maxRank", "BrMaxRank")
     captain_br_points = pick(captain, "rankingPoints", "BrRankPoint")
+    captain_br_ranking_name = pick(captain, "rankingName", default="")
     captain_cs_rank = pick(captain, "csRank", "CsRank", "csMaxRank", "CsMaxRank")
     captain_cs_points = pick(captain, "csRankingPoints", "CsRankPoint", "csRankPoint")
+    captain_cs_ranking_name = pick(captain, "csRankingName", default="")
     captain_cs_stars = cs_visible_stars(captain_cs_rank, captain_cs_points)
     captain_last_login = pick(captain, "lastLoginAt", "AccountLastLogin")
 
     equipped_skills = pick(profile, "equipedSkills", "equippedSkills", "EquippedSkills", default=[])
     if isinstance(equipped_skills, list):
         equipped_skills = len(equipped_skills)
+    clothes_names = pick(profile, "clothesNames", default=[])
+    equipped_skills_names = pick(profile, "equippedSkillsNames", default="N/A")
+    avatar_character = pick(profile, "avatarName", default="N/A")
 
     credit_score = pick(credit, "creditScore", "score")
     credit_valid = pick(credit, "periodicSummaryEndTime", "validUntil")
-    credit_status = "Good" if str(credit_score).isdigit() and int(credit_score) >= 90 else "N/A"
+    credit_status = pick(credit, "rewardState", default="")
+    if not credit_status:
+        credit_status = "Good" if str(credit_score).isdigit() and int(credit_score) >= 90 else "N/A"
 
     requested_at = datetime.now().strftime("%d %b %Y %H:%M:%S")
     requester_name = str(requester.first_name or requester.username or requester.id)
     sections = [
-        (
-            "🎮 FREE FIRE PROFILE\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            "👤 BASIC INFORMATION\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ Nickname: {nickname}\n"
-            f"🆔 UID: {uid}\n"
-            f"🌐 Region: {str(region).upper()}\n"
-            f"📈 Level: {format_number(level)}\n"
-            f"✨ EXP: {format_number(exp)}\n"
-            f"💙 Likes: {format_number(likes)}\n"
-            f"🎖 Badges: {format_number(badges)}\n"
-            f"💎 Prime Level: {format_number(prime_level)}\n"
-            f"🏅 Title ID: {format_number(title)}\n"
-            f"📆 Created: {format_unix_date(created)}\n"
-            f"⏱ Last Login: {format_unix_date(last_login)}"
-        ),
-        (
-            "🏆 BATTLE ROYALE\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🥇 Rank: {rank_name(br_rank, br_points, mode='br')}\n"
-            f"📊 Points: {format_number(br_points)}"
-        ),
-        (
-            "⚔️ CLASH SQUAD\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🥈 Rank: {rank_name(cs_rank, cs_points, mode='cs')}\n"
-            f"⭐️Total Stars: {format_number(cs_points)}"
-        ),
+        "🎮 FREE FIRE PROFILE\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        info_section("👤 BASIC INFORMATION", [
+            info_line("🏷️ Nickname", nickname),
+            info_line("🆔 UID", uid),
+            info_line("🌐 Region", str(region).upper() if not is_missing_value(region) else ""),
+            info_line("📈 Level", format_number(level)),
+            info_line("📊 Level Progress", level_progress),
+            info_line("✨ EXP", format_number(exp)),
+            info_line("🎯 EXP Needed", format_number(exp_needed)),
+            info_line("💙 Likes", format_number(likes)),
+            info_line("🎖 Badges", format_number(badges)),
+            info_line("💎 Prime Level", format_number(prime_level)),
+            info_line("🏅 Title", title_name if not is_missing_value(title_name) else format_number(title)),
+            info_line("🛡 Ban Status", ban_status),
+            info_line("📦 Version", release_version),
+            info_line("📆 Created", format_unix_date(created)),
+            info_line("⏱ Last Login", format_unix_date(last_login)),
+        ]),
+        info_section("🏆 BATTLE ROYALE", [
+            info_line("🥇 Rank", br_ranking_name or rank_name(br_rank, br_points, mode='br')),
+            info_line("📊 Points", format_number(br_points)),
+        ]),
+        info_section("⚔️ CLASH SQUAD", [
+            info_line("🥈 Rank", cs_ranking_name or rank_name(cs_rank, cs_points, mode='cs')),
+            info_line("⭐️Total Stars", format_number(cs_points)),
+        ]),
     ]
 
     has_clan = any(
@@ -1404,14 +1493,14 @@ def build_ffinfo_text(payload, requester):
     )
     if has_clan:
         sections.append(
-            "🏰 CLAN INFORMATION\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ Name: {pick(clan, 'clanName', 'GuildName')}\n"
-            f"🆔 ID: {format_number(pick(clan, 'clanId', 'Guildid', 'GuildID'))}\n"
-            f"📈 Level: {format_number(pick(clan, 'clanLevel', 'GuildLevel'))}\n"
-            f"👥 Members: {format_number(clan_members)}/{format_number(clan_capacity)} ({format_percent(clan_members, clan_capacity)})\n"
-            f"👑 Captain: {captain_name}\n"
-            f"🆔 Captain UID: {format_number(captain_uid)}"
+            info_section("🏰 CLAN INFORMATION", [
+                info_line("🏷️ Name", pick(clan, 'clanName', 'GuildName')),
+                info_line("🆔 ID", format_number(pick(clan, 'clanId', 'Guildid', 'GuildID'))),
+                info_line("📈 Level", format_number(pick(clan, 'clanLevel', 'GuildLevel'))),
+                info_line("👥 Members", f"{format_number(clan_members)}/{format_number(clan_capacity)} ({format_percent(clan_members, clan_capacity)})"),
+                info_line("👑 Captain", captain_name),
+                info_line("🆔 Captain UID", format_number(captain_uid)),
+            ])
         )
 
     has_captain = has_clan and (
@@ -1423,49 +1512,57 @@ def build_ffinfo_text(payload, requester):
     )
     if has_captain:
         sections.append(
-            "👑 CAPTAIN INFORMATION\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ Name: {captain_name}\n"
-            f"🆔 UID: {format_number(pick(captain, 'accountId', 'AccountId', default=captain_uid))}\n"
-            f"🌐 Region: {str(pick(captain, 'region', 'AccountRegion', default='N/A')).upper()}\n"
-            f"📈 Level: {format_number(captain_level)}\n"
-            f"💙 Likes: {format_number(captain_likes)}\n"
-            f"🏆 BR Rank: {rank_name(captain_br_rank, captain_br_points, mode='br')}\n"
-            f"📊 Points: {format_number(captain_br_points)}\n"
-            f"⚔️ CS Rank: {rank_name(captain_cs_rank, captain_cs_points, mode='cs')}\n"
-            f"⭐️Total Stars: {format_number(captain_cs_points)}\n"
-            f"⏱ Last Login: {format_unix_date(captain_last_login)}"
+            info_section("👑 CAPTAIN INFORMATION", [
+                info_line("🏷️ Name", captain_name),
+                info_line("🆔 UID", pick(captain, 'accountId', 'AccountId', default=captain_uid)),
+                info_line("🌐 Region", str(pick(captain, 'region', 'AccountRegion', default='')).upper()),
+                info_line("📈 Level", format_number(captain_level)),
+                info_line("💙 Likes", format_number(captain_likes)),
+                info_line("🏆 BR Rank", captain_br_ranking_name or rank_name(captain_br_rank, captain_br_points, mode='br')),
+                info_line("📊 Points", format_number(captain_br_points)),
+                info_line("⚔️ CS Rank", captain_cs_ranking_name or rank_name(captain_cs_rank, captain_cs_points, mode='cs')),
+                info_line("⭐️Total Stars", format_number(captain_cs_points)),
+                info_line("⏱ Last Login", format_unix_date(captain_last_login)),
+            ])
         )
 
     sections.extend([
-        (
-            "🎨 PROFILE STYLE\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🖼 Avatar ID: {format_number(pick(profile, 'avatarId', 'AccountAvatarId'))}\n"
-            f"⚡ Skills Equipped: {format_number(equipped_skills)}"
-        ),
-        (
-            "💬 SOCIAL\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"📝 Bio: {pick(social, 'signature', 'AccountSignature', default='No bio')}\n"
-            f"🌐 Language: {clean_enum(pick(social, 'language', 'AccountLanguage'))}\n"
-            f"🔐 Privacy: {clean_enum(pick(social, 'privacy', 'AccountPrivacy'))}"
-        ),
-        (
-            "🐾 PET INFORMATION\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 ID: {format_number(pick(pet, 'id', 'PetId'))}\n"
-            f"📈 Level: {format_number(pick(pet, 'level', 'PetLevel'))}\n"
-            f"✨ EXP: {format_number(pick(pet, 'exp', 'PetEXP'))}\n"
-            f"🎨 Skin ID: {format_number(pick(pet, 'skinId', 'SkinId'))}"
-        ),
-        (
-            "✅ CREDIT SCORE\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"💯 Score: {format_number(credit_score)}/100\n"
-            f"📌 Status: {credit_status}\n"
-            f"⏳ Valid Until: {format_unix_date(credit_valid)}"
-        ),
+        info_section("🎨 PROFILE STYLE", [
+            info_line("🧍 Character", avatar_character),
+            info_line("🖼 Avatar", avatar_name),
+            info_line("🏳 Banner", banner_name),
+            info_line("🔫 Weapon", equipped_gun),
+            info_line("🏇 Animation", equipped_animation),
+            info_line("🧩 Skins", "\n" + multiline_list(weapon_skins, limit=4) if not is_missing_value(compact_list(weapon_skins, limit=4)) else ""),
+            info_line("👕 Outfit", "\n" + multiline_list(clothes_names, limit=6) if not is_missing_value(compact_list(clothes_names, limit=6)) else ""),
+            info_line("⚡ Skill Slots", format_number(equipped_skills)),
+            info_line("🧠 Skills", "\n" + multiline_list(equipped_skills_names, limit=6) if not is_missing_value(equipped_skills_names) else ""),
+        ]),
+        info_section("💬 SOCIAL", [
+            info_line("📝 Bio", pick(social, 'signature', 'AccountSignature', default='')),
+            info_line("🚻 Gender", "Unknown" if is_missing_value(pick(social, 'gender', default='')) else clean_enum(pick(social, 'gender', default=''))),
+            info_line("🌐 Language", clean_enum(pick(social, 'language', 'AccountLanguage', default=''))),
+            info_line("🎮 Mode Prefer", clean_enum(pick(social, 'modePrefer', default=''))),
+            info_line("🏆 Rank Show", clean_enum(pick(social, 'rankShow', default=''))),
+            info_line("🔐 Privacy", clean_enum(pick(social, 'privacy', 'AccountPrivacy', default=''))),
+        ]),
+        info_section("🐾 PET INFORMATION", [
+            info_line("🏷️ Name", pick(pet, 'petName', default='')),
+            info_line("🆔 ID", format_number(pick(pet, 'id', 'PetId'))),
+            info_line("📈 Level", format_number(pick(pet, 'level', 'PetLevel'))),
+            info_line("✨ EXP", format_number(pick(pet, 'exp', 'PetEXP'))),
+            info_line("", f"🎨 {pick(pet, 'skinName', default='') or format_number(pick(pet, 'skinId', 'SkinId'))}"),
+            info_line("🧠 Skill", pick(pet, 'skillName', default='')),
+        ]),
+        info_section("🗺 CRAFTLAND", [
+            info_line("🏷️ Name", pick(workshop_maps[0], 'Name', 'name', default='') if isinstance(workshop_maps, list) and workshop_maps else ''),
+            info_line("🔑 Code", pick(workshop_maps[0], 'Code', 'code', default='') if isinstance(workshop_maps, list) and workshop_maps else ''),
+        ]),
+        info_section("✅ CREDIT SCORE", [
+            info_line("💯 Score", f"{format_number(credit_score)}/100" if not is_missing_value(credit_score) else ""),
+            info_line("📌 Status", credit_status),
+            info_line("⏳ Valid Until", format_unix_date(credit_valid)),
+        ]),
         (
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🙋 Requested by: {requester_name}\n"
@@ -1473,7 +1570,7 @@ def build_ffinfo_text(payload, requester):
         ),
     ])
 
-    return "\n\n".join(sections)
+    return "\n\n".join(section for section in sections if section and str(section).strip())
 
 
 def build_local_ffinfo_text(payload, requester):
@@ -2693,13 +2790,17 @@ def process_like(message, region, uid):
         bot.reply_to(message, "You have exceeded your daily request limit.")
         return
 
-    processing_msg = bot.reply_to(message, "Please wait... Checking UID region.")
+    processing_msg = bot.reply_to(message, "Please wait... Checking UID.")
     requested_region = region
-    resolved_region, region_error = resolve_uid_region(uid)
-    if resolved_region:
-        region = resolved_region
-    elif region_error:
-        logger.info(f"Could not auto-detect region for UID {uid}: {region_error}")
+    profile_response = call_ffinfo_api(
+        region,
+        uid,
+        timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS,
+        local_only=True,
+    )
+    resolved_region = ""
+    if "error" in profile_response:
+        logger.info(f"Could not verify UID {uid} in region {region}: {profile_response.get('error')}")
         bot.edit_message_text(
             text=(
                 "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
@@ -2711,6 +2812,23 @@ def process_like(message, region, uid):
             message_id=processing_msg.message_id,
         )
         return
+    try:
+        if is_player_not_found_error(json.dumps(profile_response, ensure_ascii=False)):
+            bot.edit_message_text(
+                text=(
+                    "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
+                    f"› ᴜɪᴅ : {uid}\n"
+                    f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
+                    "Please check the UID and region, then try again."
+                ),
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+            )
+            return
+    except Exception:
+        pass
+    resolved_region = extract_ffinfo_region(profile_response) or region
+    region = resolved_region
 
     try:
         bot.edit_message_text(

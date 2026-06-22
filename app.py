@@ -974,27 +974,25 @@ def handle_ffinfo():
 
     try:
         server_name = request.args.get("server_name", "").upper()
+        local_only = str(request.args.get("local", "")).strip().lower() in {"1", "true", "yes", "on"}
 
-        external_data, resolved_region, external_error = fetch_external_ffinfo(uid, normalize_region(server_name))
-        if external_data:
-            return jsonify({
-                "source": "external",
-                "Region": resolved_region,
-                "data": external_data,
-                "status": 1,
-            })
-        if server_name:
-            return jsonify({
-                "error": f"Full ffinfo API did not return data for region {normalize_region(server_name)}.",
-                "details": external_error,
-            }), 502
+        external_error = None
+        if not local_only:
+            external_data, resolved_region, external_error = fetch_external_ffinfo(uid, normalize_region(server_name))
+            if external_data:
+                return jsonify({
+                    "source": "external",
+                    "Region": resolved_region,
+                    "data": external_data,
+                    "status": 1,
+                })
 
         tokens = load_tokens()
         if tokens is None or not tokens:
             return jsonify({"error": "Failed to load tokens and full ffinfo API did not return data."}), 500
 
         if not server_name:
-            token = tokens[0]['token']
+            token = token_value(tokens[0])
             server_name = get_region_from_token(token)
         if not server_name:
             return jsonify({"error": "server_name could not be determined from token or input"}), 400
@@ -1018,6 +1016,8 @@ def handle_ffinfo():
 
         player_info = make_request(encrypted_uid, server_name, token)
         if player_info is None:
+            if local_only:
+                return jsonify({"error": "Player not found.", "details": external_error}), 404
             app.logger.info("FF info failed. Refreshing tokens and retrying once.")
             tokens = refresh_and_load_tokens()
             if tokens is None or not tokens:
@@ -1027,7 +1027,7 @@ def handle_ffinfo():
                 return jsonify({"error": f"Token refresh succeeded, but no token exists for region {server_name}."}), 500
             player_info = make_request(encrypted_uid, server_name, token)
             if player_info is None:
-                return jsonify({"error": "Failed to retrieve player info after token refresh."}), 500
+                return jsonify({"error": "Player not found.", "details": external_error}), 404
 
         data = json.loads(MessageToJson(player_info))
         account_info = data.get('AccountInfo', {})
