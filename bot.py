@@ -2895,19 +2895,16 @@ def process_like(message, region, uid):
     requested_region = region
     resolved_region = ""
 
-    region_ok, detected_region, region_error = verify_uid_region_local(uid, requested_region)
-    if not region_ok:
-        text = (
-            wrong_region_text(uid, requested_region, detected_region)
-            if region_error == "wrong_region" and detected_region
-            else player_not_found_text(uid, requested_region)
-        )
+    detected_region, region_error = resolve_uid_region(uid)
+    if region_error:
+        logger.info(f"Could not resolve region for UID {uid}: {region_error}")
         bot.edit_message_text(
-            text=text,
+            text=player_not_found_text(uid, requested_region),
             chat_id=processing_msg.chat.id,
             message_id=processing_msg.message_id,
         )
         return
+
     region = detected_region or requested_region
     resolved_region = region
 
