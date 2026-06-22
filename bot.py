@@ -2,6 +2,7 @@
 import logging
 import os
 import random
+import re
 import sqlite3
 import sys
 import threading
@@ -1270,6 +1271,11 @@ def compact_history(history, limit=5):
     return "\n".join(lines) if lines else "N/A"
 
 
+def strip_rank_points(value):
+    text = str(value or "").strip()
+    return re.sub(r"\s*\(\d[\d,]*\)\s*$", "", text)
+
+
 def is_missing_value(value):
     if value in (None, ""):
         return True
@@ -1556,11 +1562,11 @@ def build_ffinfo_text(payload, requester):
             info_line("⏱ Last Login", format_unix_date(last_login)),
         ]),
         info_section("🏆 BATTLE ROYALE", [
-            info_line("🥇 Rank", br_ranking_name or rank_name(br_rank, br_points, mode='br')),
+            info_line("🥇 Rank", strip_rank_points(br_ranking_name) or rank_name(br_rank, br_points, mode='br')),
             info_line("📊 Points", format_number(br_points)),
         ]),
         info_section("⚔️ CLASH SQUAD", [
-            info_line("🥈 Rank", cs_ranking_name or rank_name(cs_rank, cs_points, mode='cs')),
+            info_line("🥈 Rank", strip_rank_points(cs_ranking_name) or rank_name(cs_rank, cs_points, mode='cs')),
             info_line("⭐️Total Stars", format_number(cs_points)),
         ]),
     ]
@@ -1596,9 +1602,9 @@ def build_ffinfo_text(payload, requester):
                 info_line("🌐 Region", str(pick(captain, 'region', 'AccountRegion', default='')).upper()),
                 info_line("📈 Level", format_number(captain_level)),
                 info_line("💙 Likes", format_number(captain_likes)),
-                info_line("🏆 BR Rank", captain_br_ranking_name or rank_name(captain_br_rank, captain_br_points, mode='br')),
+                info_line("🏆 BR Rank", strip_rank_points(captain_br_ranking_name) or rank_name(captain_br_rank, captain_br_points, mode='br')),
                 info_line("📊 Points", format_number(captain_br_points)),
-                info_line("⚔️ CS Rank", captain_cs_ranking_name or rank_name(captain_cs_rank, captain_cs_points, mode='cs')),
+                info_line("⚔️ CS Rank", strip_rank_points(captain_cs_ranking_name) or rank_name(captain_cs_rank, captain_cs_points, mode='cs')),
                 info_line("⭐️Total Stars", format_number(captain_cs_points)),
                 info_line("⏱ Last Login", format_unix_date(captain_last_login)),
             ])
