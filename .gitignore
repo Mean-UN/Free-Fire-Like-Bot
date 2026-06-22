@@ -23,6 +23,7 @@ guests_converted.json
 *.log
 *.pid
 autolikes.db
+regions.json
 
 # IDE/editor
 .vscode/

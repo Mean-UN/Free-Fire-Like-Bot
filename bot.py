@@ -117,6 +117,7 @@ AUTO_LIKE_VALID_SERVERS = {
 }
 UIDPASS_FILE = "uidpass.json"
 TOKEN_FILE = "tokens.json"
+REGION_CACHE_FILE = "regions.json"
 GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD")
 GUESTGEN_REGION_LANG = {
     "IND": "hi",
@@ -1703,6 +1704,30 @@ def save_json_file(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
+def get_cached_uid_region(uid):
+    cache = load_json_file(REGION_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        return ""
+    entry = cache.get(str(uid))
+    if isinstance(entry, dict):
+        return str(entry.get("region", "")).strip().upper()
+    return str(entry or "").strip().upper()
+
+
+def set_cached_uid_region(uid, region):
+    region = str(region or "").strip().upper()
+    if not region:
+        return
+    cache = load_json_file(REGION_CACHE_FILE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    cache[str(uid)] = {
+        "region": region,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_json_file(REGION_CACHE_FILE, cache)
+
+
 def build_guest_name(base_name=""):
     base_name = "".join(char for char in str(base_name or "").strip() if char.isprintable())
     superscript_digits = "⁰¹²³⁴⁵⁶⁷⁸⁹"
@@ -2746,14 +2771,26 @@ def handle_id_lookup(message):
     )
 
 
-@bot.message_handler(content_types=["new_chat_members", "left_chat_member"])
-def auto_delete_group_service_messages(message):
+def delete_group_service_message(message, event_name):
     if message.chat.type not in {"group", "supergroup"}:
-        return
+        return False
     try:
         bot.delete_message(message.chat.id, message.message_id)
+        logger.info(f"Deleted {event_name} service message in chat {message.chat.id}")
+        return True
     except Exception as e:
-        logger.info(f"Could not delete group service message in chat {message.chat.id}: {e}")
+        logger.warning(f"Could not delete {event_name} service message in chat {message.chat.id}: {e}")
+        return False
+
+
+@bot.message_handler(content_types=["new_chat_members"])
+def auto_delete_join_messages(message):
+    delete_group_service_message(message, "join")
+
+
+@bot.message_handler(content_types=["left_chat_member"])
+def auto_delete_left_messages(message):
+    delete_group_service_message(message, "left")
 
 
 @bot.message_handler(commands=["like"])
@@ -2901,15 +2938,21 @@ def process_like(message, region, uid):
     requested_region = region
     resolved_region = ""
 
-    detected_region, region_error = resolve_uid_region(uid)
-    if region_error:
-        logger.info(f"Could not resolve region for UID {uid}: {region_error}")
-        bot.edit_message_text(
-            text=player_not_found_text(uid, requested_region),
-            chat_id=processing_msg.chat.id,
-            message_id=processing_msg.message_id,
-        )
-        return
+    cached_region = get_cached_uid_region(uid)
+    if cached_region:
+        logger.info(f"Using cached region for UID {uid}: {cached_region}")
+        detected_region, region_error = cached_region, ""
+    else:
+        detected_region, region_error = resolve_uid_region(uid)
+        if region_error:
+            logger.info(f"Could not resolve region for UID {uid}: {region_error}")
+            bot.edit_message_text(
+                text=player_not_found_text(uid, requested_region),
+                chat_id=processing_msg.chat.id,
+                message_id=processing_msg.message_id,
+            )
+            return
+        set_cached_uid_region(uid, detected_region)
 
     region = detected_region or requested_region
     resolved_region = region
