@@ -2287,6 +2287,29 @@ def update_uidpass_entry(uid, password):
     return False, len(records)
 
 
+def remove_uidpass_entry(uid):
+    records = load_json_file(UIDPASS_FILE, [])
+    if not isinstance(records, list):
+        records = []
+    kept_records = [item for item in records if str(item.get("uid", "")).strip() != uid]
+    removed_uidpass = len(kept_records) != len(records)
+    if removed_uidpass:
+        save_json_file(UIDPASS_FILE, kept_records)
+
+    tokens = load_json_file(TOKEN_FILE, [])
+    if not isinstance(tokens, list):
+        tokens = []
+    kept_tokens = [
+        item for item in tokens
+        if not (isinstance(item, dict) and str(item.get("uid", "")).strip() == uid)
+    ]
+    removed_token = len(kept_tokens) != len(tokens)
+    if removed_token:
+        save_json_file(TOKEN_FILE, kept_tokens)
+
+    return removed_uidpass, removed_token, len(kept_records), len(kept_tokens)
+
+
 def upsert_token_entry(uid, token):
     tokens = load_json_file(TOKEN_FILE, [])
     if not isinstance(tokens, list):
@@ -3372,7 +3395,7 @@ def process_checkjwt(message, uid, password):
         bot.reply_to(message, text, parse_mode=parse_mode)
 
 
-@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "updateuidpass", "addremain", "checkjwt"])
+@bot.message_handler(commands=["remain", "uidpass", "adduidpass", "updateuidpass", "removeuidpass", "addremain", "checkjwt"])
 def owner_commands(message):
     if message.from_user.id != OWNER_ID:
         return
@@ -3481,6 +3504,27 @@ def owner_commands(message):
         )
         return
 
+    if cmd == "/removeuidpass":
+        if len(args) != 2:
+            bot.reply_to(message, "Use: /removeuidpass <uid>")
+            return
+
+        uid = args[1].strip()
+        if not uid.isdigit():
+            bot.reply_to(message, "UID must be numeric.")
+            return
+
+        removed_uidpass, removed_token, uidpass_total, token_total = remove_uidpass_entry(uid)
+        if not removed_uidpass and not removed_token:
+            bot.reply_to(message, f"NOT FOUND: UID {uid} does not exist in uidpass.json or tokens.json.")
+            return
+
+        bot.reply_to(
+            message,
+            f"OK: UID {uid} removed. UID/PASS total: {uidpass_total} | Tokens now: {token_total}",
+        )
+        return
+
     if cmd == "/addremain":
         if len(args) != 3:
             bot.reply_to(message, "Use: /addremain <userid> <n>\nExample: /addremain 123456789 5")
@@ -3534,6 +3578,7 @@ def help_command(message):
             "/checkjwt <uid> <password> - Check JWT API with retry\n"
             "/adduidpass <uid> <password> - Add UID/PASS and fetch only its token\n\n"
             "/updateuidpass <uid> <new_password> - Update password after token check\n"
+            "/removeuidpass <uid> - Remove UID/PASS and token\n"
             "/guestgen [region] [name] - Generate guest UID/PASS with auto-numbered name\n\n"
             f"Support: {OWNER_USERNAME}"
         )
@@ -3586,6 +3631,7 @@ def reply_all(message):
         "/checkjwt",
         "/adduidpass",
         "/updateuidpass",
+        "/removeuidpass",
         "/addremain",
         "/guestgen",
     }
