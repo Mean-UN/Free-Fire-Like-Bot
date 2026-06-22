@@ -1115,6 +1115,84 @@ def is_player_not_found_error(message):
     )
 
 
+def like_token_value(token_item):
+    if isinstance(token_item, dict):
+        return str(token_item.get("token", "")).strip()
+    return str(token_item or "").strip()
+
+
+def token_item_region(token_item):
+    claims = decode_jwt_payload(like_token_value(token_item))
+    return str(claims.get("lock_region") or claims.get("noti_region") or "").strip().upper()
+
+
+def available_local_token_regions():
+    tokens = load_json_file(TOKEN_FILE, [])
+    if not isinstance(tokens, list):
+        return []
+    regions = []
+    for item in tokens:
+        region = token_item_region(item)
+        if region and region not in regions:
+            regions.append(region)
+    return regions
+
+
+def player_not_found_text(uid, requested_region):
+    return (
+        "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
+        f"› ᴜɪᴅ : {uid}\n"
+        f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
+        "Please check the UID and region, then try again."
+    )
+
+
+def wrong_region_text(uid, requested_region, correct_region):
+    return (
+        "ᴡʀᴏɴɢ ʀᴇɢɪᴏɴ\n\n"
+        f"› ᴜɪᴅ : {uid}\n"
+        f"› ʀᴇǫᴜᴇsᴛᴇᴅ : {requested_region}\n"
+        f"› ᴄᴏʀʀᴇᴄᴛ : {correct_region}\n\n"
+        f"Please use /like {str(correct_region).lower()} {uid}"
+    )
+
+
+def verify_uid_region_local(uid, requested_region):
+    requested_region = str(requested_region or "").strip().upper()
+    response = call_ffinfo_api(
+        requested_region,
+        uid,
+        timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS,
+        local_only=True,
+    )
+    if "error" not in response:
+        try:
+            if not is_player_not_found_error(json.dumps(response, ensure_ascii=False)):
+                return True, extract_ffinfo_region(response) or requested_region, ""
+        except Exception:
+            return True, extract_ffinfo_region(response) or requested_region, ""
+
+    for region in available_local_token_regions():
+        if region == requested_region:
+            continue
+        response = call_ffinfo_api(
+            region,
+            uid,
+            timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS,
+            local_only=True,
+        )
+        if "error" in response:
+            continue
+        try:
+            if is_player_not_found_error(json.dumps(response, ensure_ascii=False)):
+                continue
+        except Exception:
+            pass
+        return False, extract_ffinfo_region(response) or region, "wrong_region"
+
+    return False, "", "not_found"
+
+
 def pick(data, *paths, default="N/A"):
     for path in paths:
         value = data
@@ -2813,45 +2891,25 @@ def process_like(message, region, uid):
         bot.reply_to(message, "You have exceeded your daily request limit.")
         return
 
-    processing_msg = bot.reply_to(message, "Please wait... Checking UID.")
+    processing_msg = bot.reply_to(message, "Please wait... Checking region.")
     requested_region = region
-    profile_response = call_ffinfo_api(
-        region,
-        uid,
-        timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS,
-        local_only=True,
-    )
     resolved_region = ""
-    if "error" in profile_response:
-        logger.info(f"Could not verify UID {uid} in region {region}: {profile_response.get('error')}")
+
+    region_ok, detected_region, region_error = verify_uid_region_local(uid, requested_region)
+    if not region_ok:
+        text = (
+            wrong_region_text(uid, requested_region, detected_region)
+            if region_error == "wrong_region" and detected_region
+            else player_not_found_text(uid, requested_region)
+        )
         bot.edit_message_text(
-            text=(
-                "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
-                f"› ᴜɪᴅ : {uid}\n"
-                f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
-                "Please check the UID and region, then try again."
-            ),
+            text=text,
             chat_id=processing_msg.chat.id,
             message_id=processing_msg.message_id,
         )
         return
-    try:
-        if is_player_not_found_error(json.dumps(profile_response, ensure_ascii=False)):
-            bot.edit_message_text(
-                text=(
-                    "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
-                    f"› ᴜɪᴅ : {uid}\n"
-                    f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
-                    "Please check the UID and region, then try again."
-                ),
-                chat_id=processing_msg.chat.id,
-                message_id=processing_msg.message_id,
-            )
-            return
-    except Exception:
-        pass
-    resolved_region = extract_ffinfo_region(profile_response) or region
-    region = resolved_region
+    region = detected_region or requested_region
+    resolved_region = region
 
     try:
         bot.edit_message_text(
@@ -2875,15 +2933,32 @@ def process_like(message, region, uid):
                 )
                 response = call_api(region, uid)
 
-        if "error" in response and not resolved_region:
-            fallback_region, fallback_error = resolve_uid_region(uid)
-            if fallback_region and fallback_region != region:
-                logger.info(f"Retrying like for UID {uid} with detected region {fallback_region} after {region} failed.")
-                requested_region = region
-                region = fallback_region
-                response = call_api(region, uid)
-            elif fallback_error:
-                logger.info(f"Like fallback region lookup failed for UID {uid}: {fallback_error}")
+        if "error" in response:
+            profile_response = call_ffinfo_api(
+                region,
+                uid,
+                timeout_seconds=FFINFO_LOOKUP_TIMEOUT_SECONDS,
+                local_only=True,
+            )
+            profile_missing = "error" in profile_response
+            if not profile_missing:
+                try:
+                    profile_missing = is_player_not_found_error(json.dumps(profile_response, ensure_ascii=False))
+                except Exception:
+                    profile_missing = False
+            if profile_missing:
+                logger.info(f"Local FF info check failed after like API error for uid={uid} region={region}: {profile_response.get('error')}")
+                bot.edit_message_text(
+                    text=(
+                        "ᴘʟᴀʏᴇʀ ɴᴏᴛ ғᴏᴜɴᴅ\n\n"
+                        f"› ᴜɪᴅ : {uid}\n"
+                        f"› ʀᴇɢɪᴏɴ : {requested_region}\n\n"
+                        "Please check the UID and region, then try again."
+                    ),
+                    chat_id=processing_msg.chat.id,
+                    message_id=processing_msg.message_id,
+                )
+                return
 
         if "error" in response and auto_refreshed:
             response["error"] = f"{response['error']} (tokens auto-refreshed and retried once)"
