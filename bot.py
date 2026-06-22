@@ -57,6 +57,7 @@ load_env_file()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:5001").rstrip("/")
@@ -115,9 +116,9 @@ AUTO_LIKE_VALID_SERVERS = {
     ).split(",")
     if item.strip()
 }
-UIDPASS_FILE = "uidpass.json"
-TOKEN_FILE = "tokens.json"
-REGION_CACHE_FILE = "regions.json"
+UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
+TOKEN_FILE = os.path.join(BASE_DIR, "tokens.json")
+REGION_CACHE_FILE = os.path.join(BASE_DIR, "regions.json")
 GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD")
 GUESTGEN_REGION_LANG = {
     "IND": "hi",
@@ -1725,7 +1726,11 @@ def set_cached_uid_region(uid, region):
         "region": region,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
-    save_json_file(REGION_CACHE_FILE, cache)
+    try:
+        save_json_file(REGION_CACHE_FILE, cache)
+        logger.info(f"Saved region cache for UID {uid}: {region}")
+    except Exception as e:
+        logger.warning(f"Could not save region cache file {REGION_CACHE_FILE}: {e}")
 
 
 def build_guest_name(base_name=""):
