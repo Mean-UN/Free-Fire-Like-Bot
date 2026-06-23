@@ -119,6 +119,7 @@ AUTO_LIKE_VALID_SERVERS = {
 UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
 TOKEN_FILE = os.path.join(BASE_DIR, "tokens.json")
 REGION_CACHE_FILE = os.path.join(BASE_DIR, "regions.json")
+TELEGRAM_USERS_FILE = os.path.join(BASE_DIR, "telegram_users.json")
 GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD")
 GUESTGEN_REGION_LANG = {
     "IND": "hi",
@@ -1705,6 +1706,95 @@ def save_json_file(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
+def normalize_telegram_username(username):
+    return str(username or "").strip().lstrip("@").lower()
+
+
+def telegram_user_to_record(user):
+    if not user:
+        return None
+    username = getattr(user, "username", None)
+    return {
+        "id": getattr(user, "id", None),
+        "username": f"@{username}" if username else "N/A",
+        "first_name": getattr(user, "first_name", "") or "",
+        "last_name": getattr(user, "last_name", "") or "",
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def cache_telegram_user(user):
+    record = telegram_user_to_record(user)
+    if not record or not record.get("id"):
+        return
+    username_key = normalize_telegram_username(getattr(user, "username", ""))
+    if not username_key:
+        return
+
+    cache = load_json_file(TELEGRAM_USERS_FILE, {})
+    if not isinstance(cache, dict):
+        cache = {}
+    users = cache.get("by_username", {})
+    if not isinstance(users, dict):
+        users = {}
+    users[username_key] = record
+    cache["by_username"] = users
+    try:
+        save_json_file(TELEGRAM_USERS_FILE, cache)
+    except Exception as e:
+        logger.warning(f"Could not save Telegram user cache {TELEGRAM_USERS_FILE}: {e}")
+
+
+def cache_message_users(message):
+    cache_telegram_user(getattr(message, "from_user", None))
+    replied = getattr(message, "reply_to_message", None)
+    if replied:
+        cache_telegram_user(getattr(replied, "from_user", None))
+    for entity in getattr(message, "entities", None) or []:
+        if getattr(entity, "type", "") == "text_mention":
+            cache_telegram_user(getattr(entity, "user", None))
+
+
+def find_cached_telegram_user(username):
+    username_key = normalize_telegram_username(username)
+    if not username_key:
+        return None
+    cache = load_json_file(TELEGRAM_USERS_FILE, {})
+    if not isinstance(cache, dict):
+        return None
+    users = cache.get("by_username", {})
+    if not isinstance(users, dict):
+        return None
+    return users.get(username_key)
+
+
+def get_text_mention_user(message):
+    for entity in getattr(message, "entities", None) or []:
+        if getattr(entity, "type", "") == "text_mention" and getattr(entity, "user", None):
+            return entity.user
+    return None
+
+
+def lookup_telegram_username(username):
+    cached = find_cached_telegram_user(username)
+    if cached:
+        return cached
+
+    username_key = normalize_telegram_username(username)
+    if not username_key:
+        return None
+    try:
+        chat = bot.get_chat(f"@{username_key}")
+    except Exception as e:
+        logger.info(f"Could not resolve Telegram username @{username_key}: {e}")
+        return None
+
+    record = telegram_user_to_record(chat)
+    if record:
+        cache_telegram_user(chat)
+    return record
+
+
 def get_cached_uid_region(uid):
     cache = load_json_file(REGION_CACHE_FILE, {})
     if not isinstance(cache, dict):
@@ -2761,19 +2851,68 @@ def start_command(message):
 
 @bot.message_handler(commands=["id", "chatid"])
 def handle_id_lookup(message):
+    cache_message_users(message)
     user = message.from_user
     chat = message.chat
     username = f"@{user.username}" if getattr(user, "username", None) else "N/A"
     chat_label = "Group ID" if chat.type in {"group", "supergroup"} else "Chat ID"
-
-    bot.reply_to(
-        message,
-        "Telegram IDs\n\n"
-        f"User ID: {user.id}\n"
-        f"Username: {username}\n"
-        f"{chat_label}: {chat.id}\n"
+    lines = [
+        "Telegram IDs",
+        "",
+        f"Your User ID: {user.id}",
+        f"Your Username: {username}",
+        f"{chat_label}: {chat.id}",
         f"Chat Type: {chat.type}",
-    )
+    ]
+
+    replied = getattr(message, "reply_to_message", None)
+    replied_user = getattr(replied, "from_user", None) if replied else None
+    if replied_user:
+        cache_telegram_user(replied_user)
+        replied_username = f"@{replied_user.username}" if getattr(replied_user, "username", None) else "N/A"
+        lines.extend(
+            [
+                "",
+                "Replied User",
+                f"User ID: {replied_user.id}",
+                f"Username: {replied_username}",
+                f"Name: {replied_user.first_name or ''} {replied_user.last_name or ''}".strip(),
+            ]
+        )
+
+    args = message.text.split(maxsplit=1)
+    target_arg = args[1].strip() if len(args) > 1 else ""
+    mentioned_user = get_text_mention_user(message)
+    if mentioned_user:
+        cache_telegram_user(mentioned_user)
+        target_record = telegram_user_to_record(mentioned_user)
+    elif target_arg and target_arg.startswith("@"):
+        target_record = lookup_telegram_username(target_arg)
+    else:
+        target_record = None
+
+    if target_arg:
+        lines.append("")
+        if target_record:
+            target_name = f"{target_record.get('first_name', '')} {target_record.get('last_name', '')}".strip() or "N/A"
+            lines.extend(
+                [
+                    "Username Lookup",
+                    f"User ID: {target_record.get('id')}",
+                    f"Username: {target_record.get('username', 'N/A')}",
+                    f"Name: {target_name}",
+                ]
+            )
+        elif target_arg.startswith("@"):
+            lines.extend(
+                [
+                    "Username Lookup",
+                    f"Username: {target_arg}",
+                    "User ID: Not found. Ask the user to send one message in this group, then try again.",
+                ]
+            )
+
+    bot.reply_to(message, "\n".join(lines))
 
 
 def delete_group_service_message(message, event_name):
@@ -3732,6 +3871,7 @@ def help_command(message):
 
 @bot.message_handler(func=lambda message: True, content_types=["text"])
 def reply_all(message):
+    cache_message_users(message)
     if not message.text.startswith("/"):
         return
 
