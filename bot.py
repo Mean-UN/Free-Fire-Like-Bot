@@ -146,7 +146,7 @@ if set(GUESTGEN_REGIONS) != set(GUESTGEN_REGION_LANG):
     missing_lang = sorted(set(GUESTGEN_REGIONS) - set(GUESTGEN_REGION_LANG))
     extra_lang = sorted(set(GUESTGEN_REGION_LANG) - set(GUESTGEN_REGIONS))
     raise RuntimeError(f"Guestgen region/language mismatch. missing={missing_lang} extra={extra_lang}")
-RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB53").strip() or "OB53"
+RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB54").strip() or "OB54"
 MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
 MAIN_IV = b"6oyZDr22E3ychjM%"
 GUEST_REGISTER_URL = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
@@ -183,11 +183,7 @@ GUESTGEN_TOR_CONTROL_PORT = int(os.getenv("GUESTGEN_TOR_CONTROL_PORT", "9051"))
 GUESTGEN_TOR_CONTROL_PASSWORD = os.getenv("GUESTGEN_TOR_CONTROL_PASSWORD", "")
 GUESTGEN_TOR_RENEW_WAIT_SECONDS = float(os.getenv("GUESTGEN_TOR_RENEW_WAIT_SECONDS", "3"))
 GUESTGEN_MAJOR_LOGIN_USER_AGENTS = (
-    "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_I005DA Build/PI)",
-    "Dalvik/2.1.0 (Linux; U; Android 12; ASUS_Z01QD Build/SKQ1.210216.001)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; SM-G998B Build/TP1A.220624.014)",
-    "Dalvik/2.1.0 (Linux; U; Android 13; M2012K11AG Build/TKQ1.220829.002)",
-    "Dalvik/2.1.0 (Linux; U; Android 12; RMX3393 Build/SP1A.210812.016)",
+    "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
 )
 
 bot = telebot.TeleBot(BOT_TOKEN)
@@ -412,9 +408,9 @@ def get_bio_jwt(access_token):
                     "Expect": "100-continue",
                     "Host": host,
                     "ReleaseVersion": RELEASE_VERSION,
-                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; G011A Build/PI)",
+                    "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
                     "X-GA": "v1 1",
-                    "X-Unity-Version": "2018.4.11f1",
+                    "X-Unity-Version": "2022.3.47f1",
                 },
                 timeout=15,
             )
@@ -470,12 +466,12 @@ def update_bio_with_jwt(jwt_token, bio_text, server_url=""):
                 headers={
                     "Expect": "100-continue",
                     "Authorization": f"Bearer {jwt_token}",
-                    "X-Unity-Version": "2018.4.11f1",
+                    "X-Unity-Version": "2022.3.47f1",
                     "X-GA": "v1 1",
                     "ReleaseVersion": RELEASE_VERSION,
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Content-Length": str(len(encrypted_data)),
-                    "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 11; SM-A305F Build/RP1A.200720.012)",
+                    "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
                     "Host": host,
                     "Connection": "Keep-Alive",
                     "Accept-Encoding": "gzip",
@@ -2232,7 +2228,7 @@ def get_guest_major_login_info(session, access_token, open_id, region="", langua
                         "ReleaseVersion": RELEASE_VERSION,
                         "User-Agent": random.choice(GUESTGEN_MAJOR_LOGIN_USER_AGENTS),
                         "X-GA": "v1 1",
-                        "X-Unity-Version": "2018.4.11f1",
+                        "X-Unity-Version": "2022.3.47f1",
                     },
                     timeout=20,
                 )
@@ -2255,7 +2251,7 @@ def register_guest_account(region, base_name=""):
     secret = b"2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3"
     client_id = "100067"
     user_agent = "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)"
-    major_user_agent = "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)"
+    major_user_agent = "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)"
     proxy_url = get_guestgen_proxy(region)
     proxy_label = redact_proxy_url(proxy_url)
     session = configure_guestgen_session(requests.Session(), proxy_url=proxy_url)
@@ -2366,7 +2362,7 @@ def register_guest_account(region, base_name=""):
 
         major_headers = {
             "Authorization": f"Bearer {access_token}",
-            "X-Unity-Version": "2018.4.11f1",
+            "X-Unity-Version": "2022.3.47f1",
             "X-GA": "v1 1",
             "ReleaseVersion": RELEASE_VERSION,
             "Content-Type": "application/octet-stream",

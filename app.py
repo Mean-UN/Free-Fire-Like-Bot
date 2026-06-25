@@ -41,7 +41,7 @@ FFINFO_API_URL = os.getenv("FFINFO_API_URL", "https://info.killersharmabot.onlin
 FFINFO_API_KEY = os.getenv("FFINFO_API_KEY", "").strip()
 AUTO_TOKEN_REFRESH_HOURS = float(os.getenv("AUTO_TOKEN_REFRESH_HOURS", "7"))
 ENABLE_AUTO_TOKEN_REFRESH = os.getenv("ENABLE_AUTO_TOKEN_REFRESH", "true").strip().lower() in {"1", "true", "yes", "on"}
-RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB53").strip() or "OB53"
+RELEASE_VERSION = os.getenv("RELEASE_VERSION", "OB54").strip() or "OB54"
 MAIN_KEY = b"Yg&tc%DEuh6%Zc^8"
 MAIN_IV = b"6oyZDr22E3ychjM%"
 GUEST_TOKEN_GRANT_URLS = (
@@ -60,7 +60,7 @@ GUEST_CLIENT_SECRET = "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e5471
 GUEST_USER_AGENT = os.getenv("GUEST_USER_AGENT", "GarenaMSDK/4.0.19P9(SM-S908E; Android 11; en; IN)")
 MAJOR_LOGIN_USER_AGENT = os.getenv(
     "MAJOR_LOGIN_USER_AGENT",
-    "Dalvik/2.1.0 (Linux; U; Android 13; A063 Build/TKQ1.221220.001)",
+    "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
 )
 FF_NICKNAME_KEY = b"1e5898ccb8dfdd921f9bdea848768b64a201"
 FFINFO_DEFAULT_REGIONS = [
@@ -354,7 +354,7 @@ def create_jwt_token(uid, password, region=""):
                     "ReleaseVersion": RELEASE_VERSION,
                     "User-Agent": MAJOR_LOGIN_USER_AGENT,
                     "X-GA": "v1 1",
-                    "X-Unity-Version": "2018.4.11f1",
+                    "X-Unity-Version": "2022.3.47f1",
                 },
                 timeout=20,
             )
@@ -540,13 +540,13 @@ def token_value(token_item):
 
 def build_freefire_headers(token):
     return {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+        'User-Agent': "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
         'Connection': "Keep-Alive",
         'Accept-Encoding': "gzip",
         'Authorization': f"Bearer {token}",
         'Content-Type': "application/x-www-form-urlencoded",
         'Expect': "100-continue",
-        'X-Unity-Version': "2018.4.11f1",
+        'X-Unity-Version': "2022.3.47f1",
         'X-GA': "v1 1",
         'ReleaseVersion': RELEASE_VERSION,
     }
