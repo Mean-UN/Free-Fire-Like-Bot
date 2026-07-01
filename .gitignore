@@ -25,6 +25,7 @@ guests_converted.json
 autolikes.db
 regions.json
 telegram_users.json
+allowed_groups.json
 
 # IDE/editor
 .vscode/

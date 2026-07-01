@@ -120,6 +120,7 @@ UIDPASS_FILE = os.path.join(BASE_DIR, "uidpass.json")
 TOKEN_FILE = os.path.join(BASE_DIR, "tokens.json")
 REGION_CACHE_FILE = os.path.join(BASE_DIR, "regions.json")
 TELEGRAM_USERS_FILE = os.path.join(BASE_DIR, "telegram_users.json")
+ALLOWED_GROUPS_FILE = os.path.join(BASE_DIR, "allowed_groups.json")
 GUESTGEN_REGIONS = ("IND", "SG", "RU", "ID", "TW", "US", "VN", "TH", "ME", "PK", "CIS", "SAC", "BR", "BD")
 GUESTGEN_REGION_LANG = {
     "IND": "hi",
@@ -889,10 +890,21 @@ def get_active_autolike_orders():
 def get_user_autolike_orders(telegram_user_id):
     with autolike_db_lock:
         with autolike_db() as conn:
+            now = autolike_now().isoformat(timespec="seconds")
+            conn.execute(
+                """
+                UPDATE autolike_orders
+                SET status = 'completed', completed_at = COALESCE(completed_at, ?), updated_at = ?
+                WHERE telegram_user_id = ?
+                  AND status = 'active'
+                  AND (remaining_likes <= 0 OR progress_percent >= 100)
+                """,
+                (now, now, int(telegram_user_id)),
+            )
             return [
                 row_to_dict(row)
                 for row in conn.execute(
-                    "SELECT * FROM autolike_orders WHERE telegram_user_id = ? AND status != 'removed' ORDER BY id ASC",
+                    "SELECT * FROM autolike_orders WHERE telegram_user_id = ? AND status = 'active' ORDER BY id ASC",
                     (int(telegram_user_id),),
                 )
             ]
@@ -947,9 +959,17 @@ def fetch_autolike_player_snapshot(server, uid):
     return extract_player_snapshot(response)
 
 
-def autolike_daily_message(order):
+def autolike_daily_message(order, group_message=False):
+    fallback_name = str(order.get("username", "")).strip() or str(order.get("telegram_user_id", "")).strip()
+    title_name = lookup_telegram_user_name_by_id(order.get("telegram_user_id"), fallback=fallback_name) if group_message else ""
+    title = (
+        f"✓ {title_name} ᴅᴀɪʟʏ ᴀᴜᴛᴏʟɪᴋᴇ ᴜᴘᴅᴀᴛᴇ"
+        if group_message
+        else "✓ ʏᴏᴜʀ ᴅᴀɪʟʏ ᴀᴜᴛᴏʟɪᴋᴇ ᴜᴘᴅᴀᴛᴇ"
+    )
+    footer = "" if group_message else f"\n\n━━━━━━━━━━━━━━━\n↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
     return (
-        "✓ ʏᴏᴜʀ ᴅᴀɪʟʏ ᴀᴜᴛᴏʟɪᴋᴇ ᴜᴘᴅᴀᴛᴇ\n\n"
+        f"{title}\n\n"
         "━━━━━━━━━━━━━━━\n"
         f"› ᴜɪᴅ : {order['uid']}\n"
         f"› ᴘʟᴀʏᴇʀ : {order['player_name']}\n\n"
@@ -960,9 +980,8 @@ def autolike_daily_message(order):
         f"› ᴛᴏᴛᴀʟ ᴅᴇʟɪᴠᴇʀᴇᴅ : {order['total_delivered']}/{order['total_likes']}\n\n"
         "› sᴛᴀᴛᴜs\n"
         f"› ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
-        f"› ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
+        f"› ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}"
+        f"{footer}"
     )
 
 
@@ -976,8 +995,7 @@ def autolike_details_line(order, number):
         f"› ᴘᴜʀᴄʜᴀsᴇ ᴅᴀᴛᴇ : {order['purchase_date']}\n"
         f"› ᴛᴏᴛᴀʟ ʟɪᴋᴇs ɢɪᴠᴇɴ ʙʏ ʙᴏᴛ : {order['total_delivered']}\n"
         f"› ᴘʀᴏɢʀᴇss : {order['progress_percent']}%\n"
-        f"› ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}\n"
-        f"› ᴇsᴛɪᴍᴀᴛᴇᴅ ᴛɪᴍᴇ : {order['estimated_days']} days"
+        f"› ʀᴇᴍᴀɪɴɪɴɢ : {order['remaining_likes']}"
     )
 
 
@@ -992,7 +1010,7 @@ def send_autolike_update(order):
 
     group_id = get_autolike_group_id()
     if group_id:
-        group_text = text
+        group_text = autolike_daily_message(order, group_message=True)
         if private_error:
             group_text += f"\n\nPrivate update failed for {order['username']} ({order['telegram_user_id']})."
         try:
@@ -1702,6 +1720,101 @@ def save_json_file(path, data):
         json.dump(data, f, ensure_ascii=False, indent=4)
 
 
+def load_allowed_group_config():
+    data = load_json_file(ALLOWED_GROUPS_FILE, None)
+    enabled = False
+    if isinstance(data, dict):
+        enabled = bool(data.get("enabled", True))
+        data = data.get("groups", [])
+    elif isinstance(data, list):
+        enabled = True
+    else:
+        data = []
+    groups = set()
+    for item in data if isinstance(data, list) else []:
+        value = str(item).strip()
+        if value.lstrip("-").isdigit():
+            groups.add(int(value))
+    return enabled, groups
+
+
+def load_allowed_groups():
+    return load_allowed_group_config()[1]
+
+
+def is_allowed_group_mode_enabled():
+    return load_allowed_group_config()[0]
+
+
+def save_allowed_group_config(groups, enabled=True):
+    save_json_file(
+        ALLOWED_GROUPS_FILE,
+        {
+            "enabled": bool(enabled),
+            "groups": sorted(int(group_id) for group_id in groups),
+        },
+    )
+    return groups
+
+
+def save_allowed_groups(groups):
+    save_allowed_group_config(groups, enabled=True)
+
+
+def is_group_allowed(message):
+    if message.from_user and message.from_user.id == OWNER_ID:
+        return True
+    if message.chat.type not in {"group", "supergroup"}:
+        return True
+    enabled, groups = load_allowed_group_config()
+    if not enabled:
+        return True
+    return int(message.chat.id) in groups
+
+
+def is_current_group_explicitly_allowed(message):
+    if message.chat.type not in {"group", "supergroup"}:
+        return False
+    enabled, groups = load_allowed_group_config()
+    return enabled and int(message.chat.id) in groups
+
+
+def needs_channel_membership_check(message):
+    if message.from_user and message.from_user.id == OWNER_ID:
+        return False
+    return not is_current_group_explicitly_allowed(message)
+
+
+def reject_disallowed_group(message):
+    logger.info(f"Ignored command in disallowed group {message.chat.id}")
+
+
+def telegram_display_name(user):
+    if not user:
+        return "User"
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    full_name = f"{getattr(user, 'first_name', '') or ''} {getattr(user, 'last_name', '') or ''}".strip()
+    return full_name or "User"
+
+
+def autolike_plans_text():
+    return (
+        "ᴀᴜᴛᴏʟɪᴋᴇ ᴘʟᴀɴs\n\n"
+        "› 1,000 ʟɪᴋᴇs : $0.50\n"
+        "› 2,000 ʟɪᴋᴇs : $1.00\n"
+        "› 3,000 ʟɪᴋᴇs : $1.50\n"
+        "› 4,000 ʟɪᴋᴇs : $2.00\n"
+        "› 5,000 ʟɪᴋᴇs : $2.50\n"
+        "› 6,000 ʟɪᴋᴇs : $2.75\n"
+        "› 7,000 ʟɪᴋᴇs : $3.25\n"
+        "› 8,000 ʟɪᴋᴇs : $3.75\n"
+        "› 9,000 ʟɪᴋᴇs : $4.25\n"
+        "› 10,000 ʟɪᴋᴇs : $4.50\n\n"
+        f"↳ ᴏᴡɴᴇʀ : {OWNER_USERNAME}"
+    )
+
+
 def normalize_telegram_username(username):
     return str(username or "").strip().lstrip("@").lower()
 
@@ -1719,17 +1832,41 @@ def telegram_user_to_record(user):
     }
 
 
+def telegram_record_display_name(record, fallback="User"):
+    if not isinstance(record, dict):
+        return fallback
+    full_name = f"{record.get('first_name', '') or ''} {record.get('last_name', '') or ''}".strip()
+    if full_name:
+        return full_name
+    username = str(record.get("username", "")).strip()
+    if username and username != "N/A":
+        return username
+    return fallback
+
+
 def cache_telegram_user(user):
     record = telegram_user_to_record(user)
     if not record or not record.get("id"):
         return
     username_key = normalize_telegram_username(getattr(user, "username", ""))
-    if not username_key:
-        return
 
     cache = load_json_file(TELEGRAM_USERS_FILE, {})
     if not isinstance(cache, dict):
         cache = {}
+
+    by_id = cache.get("by_id", {})
+    if not isinstance(by_id, dict):
+        by_id = {}
+    by_id[str(record["id"])] = record
+    cache["by_id"] = by_id
+
+    if not username_key:
+        try:
+            save_json_file(TELEGRAM_USERS_FILE, cache)
+        except Exception as e:
+            logger.warning(f"Could not save Telegram user cache {TELEGRAM_USERS_FILE}: {e}")
+        return
+
     users = cache.get("by_username", {})
     if not isinstance(users, dict):
         users = {}
@@ -1762,6 +1899,34 @@ def find_cached_telegram_user(username):
     if not isinstance(users, dict):
         return None
     return users.get(username_key)
+
+
+def find_cached_telegram_user_by_id(user_id):
+    cache = load_json_file(TELEGRAM_USERS_FILE, {})
+    if not isinstance(cache, dict):
+        return None
+    users = cache.get("by_id", {})
+    if not isinstance(users, dict):
+        return None
+    return users.get(str(user_id))
+
+
+def lookup_telegram_user_name_by_id(user_id, fallback="User"):
+    cached = find_cached_telegram_user_by_id(user_id)
+    if cached:
+        return telegram_record_display_name(cached, fallback=fallback)
+
+    try:
+        chat = bot.get_chat(int(user_id))
+    except Exception as e:
+        logger.info(f"Could not resolve Telegram user id {user_id}: {e}")
+        return fallback
+
+    record = telegram_user_to_record(chat)
+    if record:
+        cache_telegram_user(chat)
+        return telegram_record_display_name(record, fallback=fallback)
+    return fallback
 
 
 def get_text_mention_user(message):
@@ -2948,7 +3113,11 @@ def handle_like(message):
         )
         return
 
-    if not is_user_in_channel(user_id):
+    if not is_group_allowed(message):
+        reject_disallowed_group(message)
+        return
+
+    if needs_channel_membership_check(message) and not is_user_in_channel(user_id):
         bot.reply_to(message, "You must join all our channels to use this command.", reply_markup=build_join_markup())
         return
 
@@ -2979,7 +3148,11 @@ def handle_ffinfo(message):
         )
         return
 
-    if not is_user_in_channel(user_id):
+    if not is_group_allowed(message):
+        reject_disallowed_group(message)
+        return
+
+    if needs_channel_membership_check(message) and not is_user_in_channel(user_id):
         bot.reply_to(message, "You must join all our channels to use this command.", reply_markup=build_join_markup())
         return
 
@@ -3384,15 +3557,31 @@ def handle_autolike_status(message):
 
 @bot.message_handler(commands=["myautolikes"])
 def handle_myautolikes(message):
-    username = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
     orders = get_user_autolike_orders(message.from_user.id)
+    username = str(orders[0].get("username", "")).strip() if orders else telegram_display_name(message.from_user)
+    if not username:
+        username = telegram_display_name(message.from_user)
     if not orders:
-        bot.reply_to(message, f"Hello {username}\nYou have no AutoLike orders.")
+        bot.reply_to(
+            message,
+            f"ʜᴇʟʟᴏ {username}\n\n"
+            "› ʏᴏᴜ ʜᴀᴠᴇ ɴᴏ ᴀᴜᴛᴏʟɪᴋᴇ ᴏʀᴅᴇʀs.\n"
+            "› ᴜsᴇ /plans ᴛᴏ sᴇᴇ ᴘʀɪᴄᴇs.\n\n"
+            f"↳ ᴄᴏɴᴛᴀᴄᴛ : {OWNER_USERNAME}",
+        )
         return
-    parts = [f"Hello {username}\nYour AutoLike Details:"]
+    parts = [f"ʜᴇʟʟᴏ {username}\nʏᴏᴜʀ ᴀᴜᴛᴏʟɪᴋᴇ ᴅᴇᴛᴀɪʟs:"]
     for index, order in enumerate(orders, start=1):
         parts.append(autolike_details_line(order, index))
     bot.reply_to(message, "\n\n".join(parts))
+
+
+@bot.message_handler(commands=["plans"])
+def handle_autolike_plans(message):
+    if not is_group_allowed(message):
+        reject_disallowed_group(message)
+        return
+    bot.reply_to(message, autolike_plans_text())
 
 
 @bot.message_handler(commands=["list"])
@@ -3464,6 +3653,111 @@ def handle_autolike_group_status(message):
     )
 
 
+@bot.message_handler(commands=["allowgroup"])
+def handle_allow_group(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    args = message.text.split()
+    if len(args) >= 2:
+        group_id_text = args[1].strip()
+    elif message.chat.type in {"group", "supergroup"}:
+        group_id_text = str(message.chat.id)
+    else:
+        bot.reply_to(message, "Use this in the group, or use: /allowgroup <group_id>")
+        return
+
+    if not group_id_text.lstrip("-").isdigit():
+        bot.reply_to(message, "Invalid group ID.")
+        return
+
+    groups = load_allowed_groups()
+    already_allowed = int(group_id_text) in groups
+    groups.add(int(group_id_text))
+    save_allowed_groups(groups)
+    title = "✓ ɢʀᴏᴜᴘ ᴀʟʟᴏᴡᴇᴅ" if not already_allowed else "✓ ɢʀᴏᴜᴘ ᴀʟʀᴇᴀᴅʏ ᴀʟʟᴏᴡᴇᴅ"
+    bot.reply_to(
+        message,
+        f"{title}\n\n"
+        f"› ɢʀᴏᴜᴘ ɪᴅ : {group_id_text}\n"
+        "› ᴀʟʟᴏᴡ ᴍᴏᴅᴇ : ᴏɴ",
+    )
+
+
+@bot.message_handler(commands=["removeallowgroup"])
+def handle_remove_allowed_group(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    args = message.text.split()
+    if len(args) >= 2:
+        group_id_text = args[1].strip()
+    elif message.chat.type in {"group", "supergroup"}:
+        group_id_text = str(message.chat.id)
+    else:
+        bot.reply_to(message, "Use this in the group, or use: /removeallowgroup <group_id>")
+        return
+
+    if not group_id_text.lstrip("-").isdigit():
+        bot.reply_to(message, "Invalid group ID.")
+        return
+
+    groups = load_allowed_groups()
+    group_id = int(group_id_text)
+    if group_id not in groups:
+        bot.reply_to(message, f"Group {group_id_text} is not in the allowed list.")
+        return
+
+    groups.remove(group_id)
+    save_allowed_groups(groups)
+    note = "" if groups else "\n› ɴᴏ ɢʀᴏᴜᴘs ᴀʀᴇ ᴀʟʟᴏᴡᴇᴅ ɴᴏᴡ"
+    bot.reply_to(
+        message,
+        "✓ ɢʀᴏᴜᴘ ʀᴇᴍᴏᴠᴇᴅ\n\n"
+        f"› ɢʀᴏᴜᴘ ɪᴅ : {group_id_text}\n"
+        "› ᴀʟʟᴏᴡ ᴍᴏᴅᴇ : ᴏɴ"
+        f"{note}",
+    )
+
+
+@bot.message_handler(commands=["allowedgroups"])
+def handle_allowed_groups(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    enabled, group_set = load_allowed_group_config()
+    groups = sorted(group_set)
+    if not enabled:
+        bot.reply_to(
+            message,
+            "ᴀʟʟᴏᴡᴇᴅ ɢʀᴏᴜᴘs\n\n"
+            "› ᴀʟʟᴏᴡ ᴍᴏᴅᴇ : ᴏғғ\n"
+            "› ᴀʟʟ ɢʀᴏᴜᴘs ᴀʀᴇ ᴀʟʟᴏᴡᴇᴅ\n\n"
+            "Use /allowgroup in a group to turn allow mode on.",
+        )
+        return
+
+    if not groups:
+        bot.reply_to(
+            message,
+            "ᴀʟʟᴏᴡᴇᴅ ɢʀᴏᴜᴘs\n\n"
+            "› ᴀʟʟᴏᴡ ᴍᴏᴅᴇ : ᴏɴ\n"
+            "› ɴᴏ ɢʀᴏᴜᴘs ᴀʀᴇ ᴀʟʟᴏᴡᴇᴅ",
+        )
+        return
+
+    current_status = ""
+    if message.chat.type in {"group", "supergroup"}:
+        current_status = f"\n\n› ᴄᴜʀʀᴇɴᴛ ɢʀᴏᴜᴘ : {'ᴀʟʟᴏᴡᴇᴅ' if message.chat.id in group_set else 'ɴᴏᴛ ᴀʟʟᴏᴡᴇᴅ'}"
+    text = (
+        "ᴀʟʟᴏᴡᴇᴅ ɢʀᴏᴜᴘs\n\n"
+        "› ᴀʟʟᴏᴡ ᴍᴏᴅᴇ : ᴏɴ\n"
+        + "\n".join(f"› {group_id}" for group_id in groups)
+        + current_status
+    )
+    bot.reply_to(message, text)
+
+
 @bot.message_handler(commands=["bio"])
 def handle_bio(message):
     user_id = message.from_user.id
@@ -3473,7 +3767,11 @@ def handle_bio(message):
     except Exception as e:
         logger.info(f"Could not delete /bio command message: {e}")
 
-    if not is_user_in_channel(user_id):
+    if not is_group_allowed(message):
+        reject_disallowed_group(message)
+        return
+
+    if needs_channel_membership_check(message) and not is_user_in_channel(user_id):
         bot.send_message(chat_id, "You must join all our channels to use this command.", reply_markup=build_join_markup())
         return
 
@@ -3815,11 +4113,16 @@ def owner_commands(message):
 def help_command(message):
     user_id = message.from_user.id
 
+    if not is_group_allowed(message):
+        reject_disallowed_group(message)
+        return
+
     if user_id == OWNER_ID:
         help_text = (
             "Bot Commands:\n\n"
             "/like <region> <uid> - Send likes to Free Fire UID\n"
             "/myautolikes - Show your AutoLike orders\n"
+            "/plans - Show AutoLike prices\n"
             "/ffinfo [region] <uid> - Show Free Fire player info\n"
             "/bio <token/link> <text> - Update Free Fire bio\n"
             "/start - Start or verify\n"
@@ -3833,6 +4136,9 @@ def help_command(message):
             "/setautogroup [group_id] - Set AutoLike update group\n"
             "/removeautogroup - Remove AutoLike update group\n"
             "/autogroup - Show AutoLike update group\n"
+            "/allowgroup [group_id] - Allow bot use in a group\n"
+            "/removeallowgroup [group_id] - Remove allowed group\n"
+            "/allowedgroups - Show allowed groups\n"
             "/id or /chatid - Show your user ID and current chat/group ID\n"
             "/remain - Show all users usage\n"
             "/uidpass - Show total UID/PASS records\n"
@@ -3846,11 +4152,11 @@ def help_command(message):
         bot.reply_to(message, help_text)
         return
 
-    # Allow help command even for users not in channel (but show join message)
     help_text = (
         "Bot Commands:\n\n"
         "/like <region> <uid> - Send likes to Free Fire UID\n"
         "/myautolikes - Show your AutoLike orders\n"
+        "/plans - Show AutoLike prices\n"
         "/ffinfo [region] <uid> - Show Free Fire player info\n"
         "/bio <token/link> <text> - Update Free Fire bio\n"
         "/id or /chatid - Show your user ID and current chat/group ID\n"
@@ -3861,7 +4167,7 @@ def help_command(message):
     )
     bot.reply_to(message, help_text)
     
-    if not is_user_in_channel(user_id):
+    if needs_channel_membership_check(message) and not is_user_in_channel(user_id):
         bot.reply_to(message, "To use the /like command, you must join all our channels.", reply_markup=build_join_markup())
 
 
@@ -3881,10 +4187,14 @@ def reply_all(message):
         "/extend",
         "/status",
         "/myautolikes",
+        "/plans",
         "/list",
         "/setautogroup",
         "/removeautogroup",
         "/autogroup",
+        "/allowgroup",
+        "/removeallowgroup",
+        "/allowedgroups",
         "/ffinfo",
         "/bio",
         "/help",
