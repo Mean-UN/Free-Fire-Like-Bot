@@ -1024,6 +1024,21 @@ def process_autolike_order(order):
     if order["status"] != "active":
         return
 
+    resolved_server, region_source, region_error = resolve_autolike_server(uid, order["server"])
+    if not resolved_server:
+        logger.error(f"AutoLike region error for uid={uid}: {region_error}")
+        group_id = get_autolike_group_id()
+        if group_id:
+            bot.send_message(group_id, f"❌ AutoLike failed for UID {uid}\nReason: {region_error}")
+        return
+
+    if resolved_server != order["server"]:
+        logger.info(
+            f"AutoLike daily server changed for UID {uid}: stored={order['server']} resolved={resolved_server} source={region_source}"
+        )
+        update_autolike_order(uid, {"server": resolved_server})
+        order = get_autolike_order(uid, active_only=True) or {**order, "server": resolved_server}
+
     last_likes_before = int(order["current_likes"])
     response = call_api(order["server"], uid)
     if "error" in response and is_token_error(response.get("error", "")):
@@ -1040,10 +1055,15 @@ def process_autolike_order(order):
         return
 
     player_name = str(response.get("PlayerNickname") or order["player_name"] or "Unknown").strip()
+    response_region = normalize_autolike_server(response.get("Region") or order["server"])
+    if response_region:
+        set_cached_uid_region(uid, response_region)
     current_likes = int(response.get("LikesafterCommand") or order["current_likes"] or 0)
     last_likes_before = int(response.get("LikesbeforeCommand") or last_likes_before)
     fields = calc_autolike_fields(order, last_likes_before, current_likes)
     fields["player_name"] = player_name
+    if response_region and response_region != order["server"]:
+        fields["server"] = response_region
     if fields["status"] == "completed":
         fields["completed_at"] = autolike_now().isoformat(timespec="seconds")
     update_autolike_order(uid, fields)
@@ -1982,6 +2002,27 @@ def set_cached_uid_region(uid, region):
         logger.info(f"Saved region cache for UID {uid}: {region}")
     except Exception as e:
         logger.warning(f"Could not save region cache file {REGION_CACHE_FILE}: {e}")
+
+
+def resolve_autolike_server(uid, fallback_server=""):
+    fallback_server = normalize_autolike_server(fallback_server)
+    cached_region = normalize_autolike_server(get_cached_uid_region(uid))
+    if cached_region:
+        logger.info(f"AutoLike using cached region for UID {uid}: {cached_region}")
+        return cached_region, "cache", ""
+
+    detected_region, error = resolve_uid_region(uid)
+    detected_region = normalize_autolike_server(detected_region)
+    if detected_region:
+        set_cached_uid_region(uid, detected_region)
+        logger.info(f"AutoLike detected region for UID {uid}: {detected_region}")
+        return detected_region, "detected", ""
+
+    if fallback_server:
+        logger.info(f"AutoLike using fallback server for UID {uid}: {fallback_server}. Region lookup error: {error}")
+        return fallback_server, "fallback", error
+
+    return "", "", error or "Could not detect UID region."
 
 
 def build_guest_name(base_name=""):
@@ -3433,7 +3474,28 @@ def handle_autolike_add(message):
         bot.reply_to(message, f"Duplicate active order: UID {uid} already has an active AutoLike order.")
         return
 
-    processing_msg = bot.reply_to(message, "Adding AutoLike order... Fetching player profile.")
+    processing_msg = bot.reply_to(message, "Adding AutoLike order... Checking region.")
+    resolved_server, region_source, region_error = resolve_autolike_server(uid, server)
+    if not resolved_server:
+        bot.edit_message_text(
+            text=f"Could not add AutoLike order for UID {uid}.\nReason: {region_error}",
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+        )
+        return
+    if resolved_server != server:
+        logger.info(f"AutoLike server changed for UID {uid}: requested={server} resolved={resolved_server} source={region_source}")
+    server = resolved_server
+
+    try:
+        bot.edit_message_text(
+            text=f"Adding AutoLike order... Fetching player profile in {server}.",
+            chat_id=processing_msg.chat.id,
+            message_id=processing_msg.message_id,
+        )
+    except Exception:
+        pass
+
     player_name, current_likes, error = fetch_autolike_player_snapshot(server, uid)
     if error:
         bot.edit_message_text(
